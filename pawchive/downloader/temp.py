@@ -83,6 +83,65 @@ def iter_temp_entries(root: Path) -> list[tuple[Path, int, str]]:
     )
 
 
+def preview_cache_dir(root: Path) -> Path:
+    return Path(root) / "PreviewCache"
+
+
+def iter_preview_cache_files(root: Path) -> list[tuple[Path, int]]:
+    """列出预览图缓存文件；缓存目录只保存哈希命名的图片块。"""
+    directory = preview_cache_dir(root)
+    if not directory.is_dir():
+        return []
+    result: list[tuple[Path, int]] = []
+    for item in directory.iterdir():
+        try:
+            if item.is_file():
+                result.append((item, item.stat().st_size))
+        except OSError:
+            continue
+    return sorted(result, key=lambda pair: str(pair[0]).casefold())
+
+
+def iter_state_files(root: Path) -> list[tuple[Path, int]]:
+    """列出 Temp/State 下的下载记录，包含写入中断留下的临时文件。"""
+    directory = Path(root) / "State"
+    if not directory.is_dir():
+        return []
+    result: list[tuple[Path, int]] = []
+    for pattern in ("*.json", "*.tmp"):
+        for item in directory.glob(pattern):
+            try:
+                if item.is_file():
+                    result.append((item, item.stat().st_size))
+            except OSError:
+                continue
+    return sorted(result, key=lambda pair: str(pair[0]).casefold())
+
+
+def clear_preview_cache(root: Path) -> tuple[int, int, list[str]]:
+    """删除 PreviewCache 下的缓存文件，返回 (删除数, 释放字节, 错误列表)。"""
+    return _clear_entries(iter_preview_cache_files(root))
+
+
+def clear_state_files(root: Path) -> tuple[int, int, list[str]]:
+    """删除 Temp/State 下的下载记录，返回 (删除数, 释放字节, 错误列表)。"""
+    return _clear_entries(iter_state_files(root))
+
+
+def _clear_entries(entries: list[tuple[Path, int]]) -> tuple[int, int, list[str]]:
+    deleted = 0
+    freed = 0
+    errors: list[str] = []
+    for path, size in entries:
+        try:
+            path.unlink()
+            deleted += 1
+            freed += size
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+    return deleted, freed, errors
+
+
 def clear_temp_root(root: Path) -> tuple[int, int, list[str]]:
     """删除临时根下的 .part 文件，返回 (删除数, 释放字节, 错误列表)。
 

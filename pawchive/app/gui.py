@@ -76,8 +76,12 @@ from pawchive.downloader.naming import is_image_name
 from pawchive.downloader.service import DownloadService
 from pawchive.downloader.state import StateStore, ensure_state_dir, state_dir_for
 from pawchive.downloader.temp import (
+    clear_preview_cache,
+    clear_state_files,
     clear_temp_root,
     iter_part_files,
+    iter_preview_cache_files,
+    iter_state_files,
     iter_temp_entries,
     migrate_program_root,
 )
@@ -725,6 +729,7 @@ class MessageDialog(QDialog):
         kind: str = "info",
         confirm: bool = False,
         theme: str = "dark",
+        extra_widget: QWidget | None = None,
     ):
         super().__init__(parent)
         self.confirmed = False
@@ -789,6 +794,9 @@ class MessageDialog(QDialog):
         body.setMinimumWidth(356)
         card_layout.addWidget(body)
 
+        if extra_widget is not None:
+            card_layout.addWidget(extra_widget)
+
         buttons = QHBoxLayout()
         buttons.setSpacing(10)
         buttons.addStretch(1)
@@ -847,6 +855,76 @@ class MessageDialog(QDialog):
         dialog = cls(parent, title, text, kind, confirm, theme)
         dialog.exec()
         return dialog.confirmed
+
+
+class TempCleanOptions(QWidget):
+    """临时目录清理弹窗里的三组勾选项，带各自的数量与占用。"""
+
+    changed = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        parts: tuple[int, int],
+        previews: tuple[int, int],
+        states: tuple[int, int],
+        theme: str,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.palette = palette_for(theme if theme in ("light", "dark") else "dark")
+        self.boxes: dict[str, QCheckBox] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 2)
+        layout.setSpacing(8)
+
+        items = (
+            ("part", ".part 临时文件", parts, True, "下载中断留下的分片文件，可安全删除。"),
+            ("preview", "预览图缓存", previews, True, "帖子列表的缩略图缓存，删除后下次重新加载。"),
+            ("state", "State 下载记录", states, False, "续传与去重记录；删除后已下载文件的记录会丢失。"),
+        )
+        for key, label, (count, size), default_checked, tooltip in items:
+            box = QCheckBox(f"{label}（{count} 个，{format_size(size)}）")
+            box.setToolTip(tooltip)
+            box.setEnabled(count > 0)
+            box.setChecked(bool(default_checked and count > 0))
+            box.toggled.connect(self._emit_changed)
+            self.boxes[key] = box
+            layout.addWidget(box)
+
+        self.setStyleSheet(
+            f"""
+QCheckBox {{
+    color: {self.palette.checkbox_text};
+    spacing: 8px;
+    padding: 3px 0;
+    font-size: 13px;
+}}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 1px solid {self.palette.checkbox_border};
+    border-radius: 4px;
+    background: {self.palette.checkbox_bg};
+}}
+QCheckBox::indicator:hover {{
+    border: 1px solid {self.palette.checkbox_hover_border};
+}}
+QCheckBox::indicator:checked {{
+    border: 1px solid {self.palette.checkbox_checked_border};
+    background: {self.palette.checkbox_checked_bg};
+    image: url("{CHECK_ICON_PATH.as_posix()}");
+}}
+QCheckBox:disabled {{
+    color: {self.palette.disabled_text};
+}}
+"""
+        )
+
+    def selected(self) -> set[str]:
+        return {key for key, box in self.boxes.items() if box.isChecked()}
+
+    def _emit_changed(self, *_args) -> None:
+        self.changed.emit(bool(self.selected()))
 
 
 class AnnouncementDialog(QDialog):
@@ -1654,7 +1732,22 @@ class SettingsDialog(QDialog):
         perf_form.addRow("帖子并发数：", self.post_spin)
         perf_form.addRow("失败重试次数：", self.retry_count_spin)
         perf_form.addRow("重试间隔：", self.retry_interval_spin)
-        perf_form.addRow("预览图缓存：", self.preview_cache_spin)
+
+        self.preview_cache_clear = QPushButton("清除缓存")
+        self.preview_cache_clear.setObjectName("ghostButton")
+        style_button(self.preview_cache_clear, 32, 92)
+        self.preview_cache_clear.setToolTip("删除 Temp/PreviewCache 下的在线预览图缓存")
+        self.preview_cache_clear.setEnabled(bool(self.output_dir))
+        self.preview_cache_clear.clicked.connect(self._clear_preview_cache)
+
+        cache_row = QWidget()
+        cache_layout = QHBoxLayout(cache_row)
+        cache_layout.setContentsMargins(0, 0, 0, 0)
+        cache_layout.setSpacing(8)
+        cache_layout.addWidget(self.preview_cache_spin)
+        cache_layout.addWidget(self.preview_cache_clear)
+        cache_layout.addStretch(1)
+        perf_form.addRow("预览图缓存：", cache_row)
         perf_form.addRow("图片下载：", self.image_source_combo)
         layout.addWidget(section_label("性能"))
         layout.addLayout(perf_form)
@@ -2089,6 +2182,57 @@ class SettingsDialog(QDialog):
             ui_theme=str(self.theme_combo.currentData() or "dark"),
         ).normalized()
         self.accept()
+
+    def _clear_preview_cache(self) -> None:
+        if self.output_dir is None:
+            MessageDialog.show_message(
+                self,
+                "还没有保存目录",
+                "请先在主界面选择保存目录，程序才会创建 Temp/PreviewCache。",
+                kind="info",
+                theme=self.theme,
+            )
+            return
+        temp_root = self.output_dir / "Temp"
+        entries = iter_preview_cache_files(temp_root)
+        if not entries:
+            MessageDialog.show_message(
+                self,
+                "预览图缓存是空的",
+                "Temp/PreviewCache 下没有可清理的缓存文件。",
+                kind="info",
+                theme=self.theme,
+            )
+            return
+        total = sum(size for _path, size in entries)
+        if not MessageDialog.show_message(
+            self,
+            "清除预览图缓存",
+            f"将删除 {len(entries)} 个缓存文件，共 {format_size(total)}。\n"
+            "不会影响已下载的帖子与 State 下载记录。",
+            kind="warning",
+            confirm=True,
+            theme=self.theme,
+        ):
+            return
+        deleted, freed, errors = clear_preview_cache(temp_root)
+        if errors:
+            MessageDialog.show_message(
+                self,
+                "预览图缓存未完全清除",
+                f"已删除 {deleted} 个文件，释放 {format_size(freed)}；"
+                f"仍有 {len(errors)} 个文件失败：\n" + "\n".join(errors[:6]),
+                kind="warning",
+                theme=self.theme,
+            )
+            return
+        MessageDialog.show_message(
+            self,
+            "预览图缓存已清除",
+            f"已删除 {deleted} 个缓存文件，释放 {format_size(freed)}。",
+            kind="info",
+            theme=self.theme,
+        )
 
     def _preview_theme(self, *_args) -> None:
         choice = str(self.theme_combo.currentData() or "dark")
@@ -3253,7 +3397,8 @@ class MainWindow(QMainWindow):
         temp_layout.addWidget(self.temp_list, stretch=1)
         temp_hint = QLabel(
             "临时文件固定放在 PawchiveDownload/Temp：.part 用于断点续传，"
-            "State 保存下载记录；清理只删除 .part，不会删除 State 记录。"
+            "State 保存下载记录，PreviewCache 保存帖子缩略图；"
+            "清理时可勾选要删除的类型。"
         )
         temp_hint.setObjectName("settingsHint")
         temp_hint.setWordWrap(True)
@@ -3953,8 +4098,10 @@ class MainWindow(QMainWindow):
             return
         entries = iter_temp_entries(root)
         part_files = iter_part_files(root)
-        if not entries:
-            self.temp_list.addItem("暂无临时文件或下载记录（.part 与 State 会同步显示在这里）")
+        preview_files = iter_preview_cache_files(root)
+        state_files = iter_state_files(root)
+        if not entries and not preview_files and not state_files:
+            self.temp_list.addItem("暂无临时文件或下载记录（.part、State 与预览图缓存在这里显示）")
             self.temp_clear_button.setEnabled(False)
             return
         for path, size, kind in entries[:300]:
@@ -3967,8 +4114,25 @@ class MainWindow(QMainWindow):
             self.temp_list.addItem(item)
         if len(entries) > 300:
             self.temp_list.addItem(f"……还有 {len(entries) - 300} 个临时项")
+        if preview_files:
+            preview_size = sum(size for _path, size in preview_files)
+            item = QListWidgetItem(
+                f"PreviewCache/    {format_size(preview_size)}"
+                f"    [预览图缓存 {len(preview_files)} 个]"
+            )
+            item.setToolTip("帖子列表缩略图缓存；清理后下次重新加载")
+            self.temp_list.addItem(item)
+        record_count = sum(1 for _path, _size, kind in entries if kind == "record")
+        if state_files and not record_count:
+            state_size = sum(size for _path, size in state_files)
+            item = QListWidgetItem(
+                f"State/    {format_size(state_size)}    [下载记录 {len(state_files)} 个]"
+            )
+            item.setToolTip("State 下载记录；删除后无法用现有记录续传")
+            self.temp_list.addItem(item)
         self.temp_clear_button.setEnabled(
-            bool(part_files) and not getattr(self, "_running", False)
+            bool(part_files or preview_files or state_files)
+            and not getattr(self, "_running", False)
         )
 
     def _on_temp_timer(self) -> None:
@@ -4016,37 +4180,68 @@ class MainWindow(QMainWindow):
                 kind="info", theme=self.ui_theme
             )
             return
-        files = iter_part_files(root)
-        if not files:
+        parts = iter_part_files(root)
+        previews = iter_preview_cache_files(root)
+        states = iter_state_files(root)
+        if not parts and not previews and not states:
             MessageDialog.show_message(
-                self, "没有可清理的文件", "当前临时目录里没有 .part 文件。",
-                kind="info", theme=self.ui_theme
+                self,
+                "没有可清理的内容",
+                "当前临时目录里没有 .part、预览图缓存或 State 下载记录。",
+                kind="info",
+                theme=self.ui_theme,
             )
             return
-        total = sum(size for _, size in files)
+
+        options = TempCleanOptions(
+            (len(parts), sum(size for _path, size in parts)),
+            (len(previews), sum(size for _path, size in previews)),
+            (len(states), sum(size for _path, size in states)),
+            self.ui_theme,
+        )
         dialog = MessageDialog(
             self,
-            "清理临时文件",
-            f"将删除 {len(files)} 个未完成的 .part 文件，共 {format_size(total)}。\n"
-            "已下载完成、位于保存目录的成品文件不会受影响；State 下载记录也不会删除。",
+            "清理临时目录",
+            "勾选要清理的内容。已下载完成、位于保存目录的成品文件不会受影响；"
+            "删除 State 记录后，对应 .part 将失去续传依据。",
             kind="warning",
             confirm=True,
             theme=self.ui_theme,
+            extra_widget=options,
         )
+        ok_button = dialog.findChild(QPushButton, "dialogPrimary")
+        if ok_button is not None:
+            options.changed.connect(ok_button.setEnabled)
+            ok_button.setEnabled(bool(options.selected()))
         dialog.exec()
-        if not dialog.confirmed:
+        selected = options.selected()
+        if not dialog.confirmed or not selected:
             return
+
         QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        results: list[str] = []
+        errors: list[str] = []
         try:
-            deleted, freed, errors = clear_temp_root(root)
+            if "part" in selected:
+                deleted, freed, part_errors = clear_temp_root(root)
+                results.append(f".part {deleted} 个（{format_size(freed)}）")
+                errors.extend(part_errors)
+            if "preview" in selected:
+                deleted, freed, preview_errors = clear_preview_cache(root)
+                results.append(f"预览图 {deleted} 个（{format_size(freed)}）")
+                errors.extend(preview_errors)
+            if "state" in selected:
+                deleted, freed, state_errors = clear_state_files(root)
+                results.append(f"State {deleted} 个（{format_size(freed)}）")
+                errors.extend(state_errors)
         finally:
             QApplication.restoreOverrideCursor()
         self._refresh_temp_view()
-        self._log(f"已清理 {deleted} 个临时文件，释放 {format_size(freed)}")
+        self._log("已清理临时目录：" + "，".join(results))
         if errors:
             MessageDialog.show_message(
                 self,
-                "部分临时文件未清理",
+                "部分临时内容未清理",
                 "\n".join(errors[:8]),
                 kind="warning",
                 theme=self.ui_theme,

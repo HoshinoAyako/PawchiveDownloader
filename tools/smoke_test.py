@@ -379,6 +379,144 @@ def test_state_discard() -> None:
         assert_true('"finished"' in data, "剩余成功文件状态未恢复")
 
 
+def test_temp_cleanup() -> None:
+    from pawchive.downloader.temp import (
+        clear_preview_cache,
+        clear_state_files,
+        clear_temp_root,
+        iter_part_files,
+        iter_preview_cache_files,
+        iter_state_files,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_temp_clean_") as temp:
+        root = Path(temp)
+        post_dir = root / "post"
+        post_dir.mkdir(parents=True)
+        part = post_dir / "01.png.part"
+        part.write_bytes(b"part")
+        state_dir = root / "State"
+        state_dir.mkdir()
+        (state_dir / "pawchive_patreon_user.json").write_text("{}", encoding="utf-8")
+        (state_dir / "pawchive_patreon_user.json.tmp").write_text("{}", encoding="utf-8")
+        cache_dir = root / "PreviewCache"
+        cache_dir.mkdir()
+        (cache_dir / "abc.img").write_bytes(b"img")
+
+        assert_true(len(iter_part_files(root)) == 1, ".part 数量错误")
+        assert_true(len(iter_state_files(root)) == 2, "State 文件数量错误")
+        assert_true(len(iter_preview_cache_files(root)) == 1, "预览缓存数量错误")
+
+        deleted, _freed, errors = clear_preview_cache(root)
+        assert_true(deleted == 1 and not errors, "预览缓存未清理")
+        assert_true(not (cache_dir / "abc.img").exists(), "预览缓存文件仍存在")
+
+        deleted, _freed, errors = clear_state_files(root)
+        assert_true(deleted == 2 and not errors, "State 文件未清理")
+        assert_true(not any(state_dir.iterdir()), "State 目录仍有文件")
+
+        deleted, _freed, errors = clear_temp_root(root)
+        assert_true(deleted == 1 and not errors, ".part 未清理")
+        assert_true(not part.exists(), ".part 文件仍存在")
+
+
+def test_temp_clean_options() -> None:
+    from PyQt6.QtWidgets import QApplication
+
+    from pawchive.app import gui
+
+    app = QApplication.instance() or QApplication([])
+    options = gui.TempCleanOptions((1, 10), (2, 20), (3, 30), "dark")
+    assert_true(options.boxes["part"].isChecked(), ".part 默认未勾选")
+    assert_true(options.boxes["preview"].isChecked(), "预览图默认未勾选")
+    assert_true(not options.boxes["state"].isChecked(), "State 不应默认勾选")
+    assert_true(options.selected() == {"part", "preview"}, "默认清理项错误")
+    options.boxes["state"].setChecked(True)
+    assert_true(options.selected() == {"part", "preview", "state"}, "勾选 State 未生效")
+    options.close()
+    app.processEvents()
+
+
+def test_settings_clear_cache() -> None:
+    from PyQt6.QtWidgets import QApplication
+
+    from pawchive.app import gui
+    from pawchive.settings import AppSettings
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_settings_clear_") as temp:
+        root = Path(temp) / "PawchiveDownload"
+        cache_dir = root / "Temp" / "PreviewCache"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "abc.img").write_bytes(b"x" * 1024)
+        settings = AppSettings(output_dir=temp, preview_cache_mb=32).normalized()
+        dialog = gui.SettingsDialog(
+            settings,
+            gui.load_app_font(),
+            theme="light",
+            output_dir=temp,
+        )
+        assert_true(dialog.preview_cache_clear.text() == "清除缓存", "清除缓存按钮缺失")
+        assert_true(dialog.preview_cache_clear.isEnabled(), "清除缓存按钮不可用")
+        original_message = gui.MessageDialog.show_message
+        gui.MessageDialog.show_message = staticmethod(lambda *args, **kwargs: True)
+        try:
+            dialog._clear_preview_cache()
+        finally:
+            gui.MessageDialog.show_message = original_message
+            dialog.close()
+        assert_true(not (cache_dir / "abc.img").exists(), "设置页未清除预览缓存")
+        app.processEvents()
+
+
+def test_temp_clear_gui() -> None:
+    from PyQt6.QtWidgets import QApplication, QCheckBox
+
+    from pawchive.app import gui
+    from pawchive.settings import AppSettings
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_temp_gui_") as temp:
+        settings = AppSettings(output_dir=temp, preview_cache_mb=32).normalized()
+        original_load = gui.load_settings
+        original_save = gui.save_settings
+        original_exec = gui.MessageDialog.exec
+        gui.load_settings = lambda: settings
+        gui.save_settings = lambda *args, **kwargs: None
+
+        def fake_exec(dialog) -> int:
+            for box in dialog.findChildren(QCheckBox):
+                if "State" in box.text() or "预览图缓存" in box.text() or ".part" in box.text():
+                    box.setChecked(True)
+            dialog.confirmed = True
+            return 0
+
+        gui.MessageDialog.exec = fake_exec
+        try:
+            window = gui.MainWindow(gui.load_app_font())
+            temp_root = window._temp_root()
+            assert_true(temp_root is not None, "临时目录未初始化")
+            post_dir = temp_root / "post"
+            post_dir.mkdir(parents=True)
+            (post_dir / "01.png.part").write_bytes(b"part")
+            (temp_root / "PreviewCache").mkdir(exist_ok=True)
+            (temp_root / "PreviewCache" / "abc.img").write_bytes(b"img")
+            (temp_root / "State").mkdir(exist_ok=True)
+            (temp_root / "State" / "record.json").write_text("{}", encoding="utf-8")
+            window._refresh_temp_view()
+            assert_true(window.temp_clear_button.isEnabled(), "有临时内容时清理按钮不可用")
+            window._clear_temp_files()
+            assert_true(not (post_dir / "01.png.part").exists(), ".part 未清理")
+            assert_true(not (temp_root / "PreviewCache" / "abc.img").exists(), "预览缓存未清理")
+            assert_true(not (temp_root / "State" / "record.json").exists(), "State 未清理")
+            window.close()
+        finally:
+            gui.load_settings = original_load
+            gui.save_settings = original_save
+            gui.MessageDialog.exec = original_exec
+        app.processEvents()
+
+
 def test_preview_modes() -> None:
     from PyQt6.QtCore import QBuffer, QIODevice
     from PyQt6.QtGui import QColor, QPixmap
@@ -464,6 +602,10 @@ def main() -> int:
         ("settings-ranges", test_settings_ranges),
         ("thumbnail-cache", test_thumbnail_cache),
         ("preview-cache-path", test_preview_cache_path),
+        ("temp-cleanup", test_temp_cleanup),
+        ("temp-clean-options", test_temp_clean_options),
+        ("settings-clear-cache", test_settings_clear_cache),
+        ("temp-clear-gui", test_temp_clear_gui),
         ("state-discard", test_state_discard),
         ("preview-modes", test_preview_modes),
         ("about-dialog", test_about_dialog),
