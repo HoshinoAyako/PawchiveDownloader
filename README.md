@@ -2,7 +2,7 @@
 
 Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载、附件筛选、并发控制、保存目录管理、日志导出和预览图/原图处理。
 
-当前版本：`v1.12.0`
+当前版本：`v1.13.0`
 
 版本号规则：自 `1.9.0` 起遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)；不兼容变更升主版本，向下兼容的新功能升次版本，向下兼容的问题修正升修订号。完整规则见 `CHANGELOG.md`。
 
@@ -10,7 +10,7 @@ Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载�
 
 - 创作者 URL 加载，支持帖子列表全选/反选
 - 文件并发、帖子并发与站点限速提示
-- 附件类型筛选：视频、音频、文档、压缩包、设计稿、未知扩展名
+- 附件类型筛选：视频、音频、文档、压缩包、设计稿、图片、未知扩展名
 - 图片预览图/原图下载选择
 - 预览图完整性校验：发现本地文件小于远端原图时可确认替换
 - 主保存目录 + 多个额外保存目录
@@ -79,7 +79,7 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 <64 位 SHA-256>  PawchiveDownloader-vX.Y.Z.exe
 ```
 
-可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.12.0.exe` 生成校验文件。
+可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.13.0.exe` 生成校验文件。
 仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
 
 新版更新器不再在 exe 同目录生成 `<exe 名>.sha256` 安装基线；旧版本留下的该文件会在启动时删除。更新包 SHA-256 校验与写入后的目标文件回读校验仍然保留。

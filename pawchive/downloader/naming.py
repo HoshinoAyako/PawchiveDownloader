@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .models import DateNamingMode, FileItem, PostItem
 
@@ -70,6 +71,47 @@ def unique_name(name: str, used: set[str]) -> str:
             used.add(next_name.casefold())
             return next_name
         index += 1
+
+
+def _suffix(name: str) -> str:
+    text = (name or "").strip()
+    if "." not in text:
+        return ""
+    ext = "." + text.rsplit(".", 1)[1].lower()
+    return ext if 0 < len(ext) <= 17 else ""
+
+
+def _name_from_path(path: str) -> str:
+    """从 /data/.../hash.psd?f=dn.psd 这类文件地址取可读文件名。"""
+    try:
+        parsed = urlparse(path or "")
+    except ValueError:
+        return ""
+    for key in ("f", "filename", "name"):
+        values = parse_qs(parsed.query).get(key)
+        if values:
+            candidate = unquote(values[0]).strip()
+            if candidate:
+                return candidate
+    return unquote(Path(parsed.path).name)
+
+
+def resolve_attachment_name(name: object, path: object = "") -> str:
+    """补全附件名扩展名，避免接口只给标题/哈希时把 .psd 当成未知附件。"""
+    raw_input = str(name or "").strip()
+    raw = sanitize_filename(raw_input) if raw_input else ""
+    candidate = _name_from_path(str(path or ""))
+    raw_ext = _suffix(raw)
+    candidate_ext = _suffix(candidate)
+    if raw and not raw_ext:
+        if candidate_ext:
+            base = raw[: max(1, 150 - len(candidate_ext))].rstrip(" .")
+            return sanitize_filename(f"{base}{candidate_ext}")
+        if candidate:
+            return sanitize_filename(candidate)
+    if raw:
+        return raw
+    return sanitize_filename(candidate)
 
 
 def is_image_name(name: str) -> bool:

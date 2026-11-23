@@ -72,7 +72,7 @@ from pawchive.downloader.models import (
     FileItem,
     PostItem,
 )
-from pawchive.downloader.naming import is_image_name
+from pawchive.downloader.naming import is_image_name, resolve_attachment_name
 from pawchive.downloader.service import DownloadService
 from pawchive.downloader.state import StateStore, ensure_state_dir, state_dir_for
 from pawchive.downloader.temp import (
@@ -225,8 +225,8 @@ def post_thumbnail_url(post: PostItem) -> str:
     file_info = raw.get("file")
     if isinstance(file_info, dict):
         path = str(file_info.get("path") or "").strip()
-        name = str(file_info.get("name") or "").strip()
-        if path and (is_image_name(name) or "/data/" in path):
+        name = resolve_attachment_name(file_info.get("name", ""), path)
+        if path and is_image_name(name):
             candidates.append(path)
     attachments = raw.get("attachments")
     if isinstance(attachments, list):
@@ -234,7 +234,7 @@ def post_thumbnail_url(post: PostItem) -> str:
             if not isinstance(item, dict):
                 continue
             path = str(item.get("path") or "").strip()
-            name = str(item.get("name") or "").strip()
+            name = resolve_attachment_name(item.get("name", ""), path)
             if path and is_image_name(name):
                 candidates.append(path)
     if not candidates:
@@ -1671,6 +1671,11 @@ class SettingsDialog(QDialog):
         attachment_grid.setContentsMargins(0, 0, 0, 0)
         attachment_grid.setHorizontalSpacing(14)
         attachment_grid.setVerticalSpacing(4)
+        self.image_box = QCheckBox("图片（JPG/PNG/GIF/WEBP 等）")
+        self.image_box.setMinimumHeight(22)
+        self.image_box.setChecked(self.result_settings.include_images)
+        self.image_box.setToolTip("取消勾选后不下载图片附件，只下载下面勾选的附件分类")
+        attachment_grid.addWidget(self.image_box, 0, 0)
         for index, (key, label, exts) in enumerate(ATTACHMENT_CATEGORIES):
             box = QCheckBox(label)
             box.setMinimumHeight(22)
@@ -1680,12 +1685,13 @@ class SettingsDialog(QDialog):
             else:
                 box.setToolTip("勾选后允许下载所有未识别扩展名的附件")
             self.attachment_boxes[key] = box
-            attachment_grid.addWidget(box, index // 2, index % 2)
+            slot = index + 1
+            attachment_grid.addWidget(box, slot // 2, slot % 2)
             if key == "other":
                 box.toggled.connect(self._sync_attachment_state)
         attachment_layout.addLayout(attachment_grid)
 
-        image_note = QLabel("图片（jpg/png/gif/webp 等）始终下载，无需勾选。")
+        image_note = QLabel("图片是否下载由上方“图片”勾选控制；取消后不会下载任何图片附件。")
         image_note.setObjectName("settingsHint")
         image_note.setWordWrap(True)
         attachment_layout.addWidget(image_note)
@@ -2171,6 +2177,7 @@ class SettingsDialog(QDialog):
             proxy_type=proxy_type,
             proxy_address=proxy_address,
             attachment_types=attachment_types,
+            include_images=self.image_box.isChecked(),
             extra_extensions=extra_extensions,
             temp_custom_extensions=temp_enabled,
             announcement_dismissed_version=self.result_settings.announcement_dismissed_version,

@@ -8,7 +8,7 @@ import aiohttp
 
 from pawchive.config import INCLUDE_OTHER_ATTACHMENTS
 from pawchive.downloader.models import FileItem, PostItem
-from pawchive.downloader.naming import is_image_name, sanitize_filename
+from pawchive.downloader.naming import is_image_name, resolve_attachment_name
 from pawchive.net import build_network_options
 from pawchive.settings import AppSettings
 from pawchive.version import APP_VERSION
@@ -88,12 +88,17 @@ class PawchiveApi:
         files: list[FileItem] = []
 
         for item in attachments:
-            name = sanitize_filename(item.get("name", "file"))
-            path = item.get("path", "")
-            if not name or not path:
+            path = str(item.get("path", "") or "").strip()
+            if not path:
+                continue
+            name = resolve_attachment_name(item.get("name", ""), path)
+            if not name:
                 continue
             kind = "image" if is_image_name(name) else "file"
-            if kind != "image" and not self._allows_attachment(name):
+            if kind == "image":
+                if not self.settings.include_images:
+                    continue
+            elif not self._allows_attachment(name):
                 continue
             url = build_file_url(path, kind, self.image_source)
             files.append(FileItem(url=url, name=name, kind=kind))

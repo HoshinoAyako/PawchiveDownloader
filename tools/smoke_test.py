@@ -517,6 +517,63 @@ def test_temp_clear_gui() -> None:
         app.processEvents()
 
 
+def test_attachment_selection() -> None:
+    import asyncio
+    import json
+
+    from pawchive.api.pawchive import PawchiveApi
+    from pawchive.downloader.models import PostItem
+    from pawchive.downloader.naming import resolve_attachment_name
+    from pawchive.settings import AppSettings, load_settings
+
+    psd_url = (
+        "https://n4.pawchive.pw/data/260/4a/"
+        "604a3295e2d988afa4ab100e6ab9d2111b52b02641d49110abdf3d3a753c5bc3.psd"
+        "?f=dn.psd"
+    )
+    assert_true(
+        resolve_attachment_name("dn", psd_url) == "dn.psd",
+        "没有扩展名的附件名未从 URL 补全",
+    )
+    assert_true(
+        resolve_attachment_name("", "https://example.invalid/a/pic.png?f=cover.png")
+        == "cover.png",
+        "空附件名未采用查询参数中的文件名",
+    )
+
+    class FakeApi(PawchiveApi):
+        async def _get_detail(self, post: PostItem) -> dict:
+            return {
+                "file": {"name": "dn", "path": psd_url},
+                "attachments": [
+                    {"name": "pic", "path": "https://example.invalid/a/pic.png"},
+                    {"name": "doc", "path": "https://example.invalid/a/doc.pdf"},
+                ],
+            }
+
+    post = PostItem("1", "title", "2026-01-01T00:00:00", "https://example.invalid", "1", "patreon")
+    no_image = FakeApi(settings=AppSettings(attachment_types=("design", "document"), include_images=False))
+    names = [item.name for item in asyncio.run(no_image.get_post_files(post))]
+    assert_true(names == ["dn.psd", "doc.pdf"], "图片关闭或 PSD 识别结果错误")
+    with_image = FakeApi(settings=AppSettings(attachment_types=("design", "document"), include_images=True))
+    names = [item.name for item in asyncio.run(with_image.get_post_files(post))]
+    assert_true(names == ["dn.psd", "pic.png", "doc.pdf"], "图片开启后附件结果错误")
+
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_attachment_") as temp:
+        path = Path(temp) / "Settings.json"
+        path.write_text(
+            json.dumps({"attachment_types": ["video", "document"]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        old = load_settings(path)
+        assert_true(old.include_images, "旧配置缺少 include_images 时应默认下载图片")
+        from pawchive.settings import save_settings
+
+        save_settings(AppSettings(attachment_types=("design",), include_images=False), path)
+        saved = load_settings(path)
+        assert_true(not saved.include_images, "include_images 未持久化")
+
+
 def test_preview_modes() -> None:
     from PyQt6.QtCore import QBuffer, QIODevice
     from PyQt6.QtGui import QColor, QPixmap
@@ -605,6 +662,7 @@ def main() -> int:
         ("temp-cleanup", test_temp_cleanup),
         ("temp-clean-options", test_temp_clean_options),
         ("settings-clear-cache", test_settings_clear_cache),
+        ("attachment-selection", test_attachment_selection),
         ("temp-clear-gui", test_temp_clear_gui),
         ("state-discard", test_state_discard),
         ("preview-modes", test_preview_modes),

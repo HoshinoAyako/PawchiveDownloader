@@ -70,7 +70,8 @@ DEFAULT_POST_CONCURRENCY = 1
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif")
 
 # 附件分类：(键, 界面文案, 归类扩展名)。界面文案直接用扩展名，方便一眼看懂。
-# 图片始终下载，不在此列。"other" 没有固定扩展名，勾选后表示允许下载所有未识别的扩展名。
+# 图片通过 AppSettings.include_images 单独控制；"other" 没有固定扩展名，
+# 勾选后表示允许下载所有未识别的扩展名。
 ATTACHMENT_CATEGORIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("video", "MP4/MKV/AVI 等视频", (".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v", ".wmv", ".ts", ".flv", ".m2ts")),
     ("archive", "ZIP/RAR/7Z 等压缩包", (".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst", ".001")),
@@ -392,6 +393,8 @@ class AppSettings:
     proxy_type: str = "none"
     proxy_address: str = ""
     attachment_types: tuple[str, ...] = ()
+    # 是否下载图片附件；旧配置缺少此字段时按 True 处理，保持原有“图片始终下载”行为。
+    include_images: bool = True
     extra_extensions: tuple[str, ...] = ()
     # 仅本次任务生效的自定义扩展名开关；勾了“其他未知扩展名”时无需它。
     temp_custom_extensions: bool = False
@@ -450,6 +453,7 @@ class AppSettings:
             proxy_type=self.proxy_type,
             proxy_address=self.proxy_address,
             attachment_types=self.attachment_types,
+            include_images=self.include_images,
             extra_extensions=self.extra_extensions if "other" in self.attachment_types else (),
             temp_custom_extensions=False,
             announcement_dismissed_version=self.announcement_dismissed_version,
@@ -523,6 +527,7 @@ class AppSettings:
             proxy_type=proxy_type,
             proxy_address=address,
             attachment_types=types,
+            include_images=bool(self.include_images),
             extra_extensions=extras,
             temp_custom_extensions=temp_enabled,
             announcement_dismissed_version=str(self.announcement_dismissed_version or "").strip()[:32],
@@ -547,6 +552,7 @@ def _settings_from_dict(data: dict) -> AppSettings:
         proxy_type=str(data.get("proxy_type", "none")),
         proxy_address=str(data.get("proxy_address", "") or ""),
         attachment_types=data.get("attachment_types", ()) or (),
+        include_images=bool(data.get("include_images", True)),
         extra_extensions=data.get("extra_extensions", ()) or (),
         temp_custom_extensions=bool(data.get("temp_custom_extensions", False)),
         announcement_dismissed_version=str(data.get("announcement_dismissed_version", "") or ""),
@@ -670,8 +676,10 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> Path | Non
 
 def describe_attachments(settings: AppSettings) -> str:
     if "other" in settings.attachment_types:
-        return "附件全收"
+        return "附件全收（含图片）" if settings.include_images else "附件全收（不含图片）"
     parts = [ATTACHMENT_CATEGORY_SHORT[key] for key in settings.attachment_types]
+    if settings.include_images:
+        parts.insert(0, "图片")
     extras = settings.effective_extra_extensions
     if extras:
         text = ", ".join("." + ext for ext in extras[:4])
@@ -679,7 +687,7 @@ def describe_attachments(settings: AppSettings) -> str:
             text += f" 等 {len(extras)} 种"
         prefix = "临时 " if settings.temp_custom_extensions else "自定义 "
         parts.append(prefix + text)
-    return "+".join(parts) or "仅图片"
+    return "+".join(parts) or "不下载附件"
 
 
 def describe_settings(settings: AppSettings) -> str:
