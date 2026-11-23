@@ -590,6 +590,10 @@ QListWidget#failedList::item {
     min-height: 48px;
     padding: 4px 8px;
 }
+QListWidget#queueList::item {
+    min-height: 48px;
+    padding: 4px 8px;
+}
 QScrollArea#previewScroll {
     background: transparent;
     border: 1px solid @{list_border};

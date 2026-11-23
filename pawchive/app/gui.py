@@ -73,6 +73,13 @@ from pawchive.downloader.models import (
     PostItem,
 )
 from pawchive.downloader.naming import is_image_name, resolve_attachment_name
+from pawchive.downloader.queue import (
+    QueueItem,
+    build_queue_tasks,
+    create_temp_placeholders,
+    ensure_post_marker,
+    remove_temp_placeholders,
+)
 from pawchive.downloader.service import DownloadService
 from pawchive.downloader.state import StateStore, ensure_state_dir, state_dir_for
 from pawchive.downloader.temp import (
@@ -2178,6 +2185,7 @@ class SettingsDialog(QDialog):
             proxy_address=proxy_address,
             attachment_types=attachment_types,
             include_images=self.image_box.isChecked(),
+            queue_precreate_temps=self.result_settings.queue_precreate_temps,
             extra_extensions=extra_extensions,
             temp_custom_extensions=temp_enabled,
             announcement_dismissed_version=self.result_settings.announcement_dismissed_version,
@@ -2507,7 +2515,7 @@ class DownloadWorker(QObject):
             return None
         target = Path(str(data.get("target_path") or event.path or ""))
         temp = Path(str(data.get("temp_path") or ""))
-        if not target or not temp:
+        if not str(target) or not str(temp):
             return None
         return FailedDownload(
             post=post,
@@ -2541,6 +2549,263 @@ class DownloadWorker(QObject):
             if first_write:
                 file.write("# Pawchive Downloader failed files\n\n")
             file.write(text)
+
+
+class QueuePrepareWorker(QObject):
+    """在后台为下载列表读取帖子详情并建立空白 .part 占位。"""
+
+    log = pyqtSignal(str)
+    item_changed = pyqtSignal(object)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, items: list[QueueItem]):
+        super().__init__()
+        self.items = list(items)
+        self.stop_event = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+    async def _main(self) -> None:
+        prepared = 0
+        failed = 0
+        for item in self.items:
+            if self.stop_event.is_set():
+                break
+            item.status = "preparing"
+            item.error = ""
+            self.item_changed.emit(item)
+            self.log.emit(f"正在预建临时文件: {item.post.title}")
+            try:
+                api = PawchiveApi(
+                    settings=item.settings,
+                    image_source=item.settings.image_source,
+                )
+                tasks = await build_queue_tasks(item, api)
+                created = create_temp_placeholders(tasks) if item.precreate else 0
+                item.status = "ready"
+                self.item_changed.emit(item)
+                prepared += 1
+                if item.precreate:
+                    self.log.emit(
+                        f"已预建 {created}/{len(tasks)} 个临时文件: {item.post.title}"
+                    )
+            except Exception as exc:
+                failed += 1
+                item.status = "error"
+                item.error = str(exc)
+                self.item_changed.emit(item)
+                self.log.emit(f"预建失败: {item.post.title} - {exc}")
+        self.finished.emit(
+            f"预建结束：成功 {prepared} 条" + (f"，失败 {failed} 条" if failed else "")
+        )
+
+
+class QueueDownloadWorker(QObject):
+    """按下载列表顺序处理帖子；预建好的任务直接续传。"""
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int, int)
+    entry_changed = pyqtSignal(object)
+    entry_progress = pyqtSignal(object, int, int, int)
+    failed_item = pyqtSignal(object)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, items: list[QueueItem]):
+        super().__init__()
+        self.items = list(items)
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+        self.stop_event = threading.Event()
+        self._states: dict[tuple[str, str], StateStore] = {}
+        self._total = 0
+        self._done = 0
+        self._failed = 0
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def pause(self) -> None:
+        self.pause_event.clear()
+
+    def resume(self) -> None:
+        self.pause_event.set()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.pause_event.set()
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as exc:
+            for item in self.items:
+                if item.status in {"running", "preparing"}:
+                    item.status = "stopped"
+                    item.error = str(exc)
+                    self.entry_changed.emit(item)
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+    async def _main(self) -> None:
+        completed = 0
+        failed_posts = 0
+        stopped_posts = 0
+        for item in self.items:
+            if self.stop_event.is_set():
+                item.status = "stopped"
+                item.error = "下载已停止"
+                self.entry_changed.emit(item)
+                stopped_posts += 1
+                continue
+
+            if not item.tasks:
+                item.status = "preparing"
+                self.entry_changed.emit(item)
+                self.log.emit(f"正在整理下载任务: {item.post.title}")
+                try:
+                    api = PawchiveApi(
+                        settings=item.settings,
+                        image_source=item.settings.image_source,
+                    )
+                    tasks = await build_queue_tasks(item, api, write_marker=True)
+                    if item.precreate:
+                        create_temp_placeholders(tasks)
+                    self._total += len(tasks)
+                    self.progress.emit(self._done, self._total, self._failed)
+                except Exception as exc:
+                    item.status = "error"
+                    item.error = str(exc)
+                    item.tasks = None
+                    failed_posts += 1
+                    self.entry_changed.emit(item)
+                    self.log.emit(f"整理失败: {item.post.title} - {exc}")
+                    continue
+            else:
+                self._total += len(item.tasks)
+                self.progress.emit(self._done, self._total, self._failed)
+
+            item.status = "running"
+            item.error = ""
+            item.progress_done = 0
+            item.progress_total = len(item.tasks or ())
+            item.progress_failed = 0
+            ensure_post_marker(item)
+            self.entry_changed.emit(item)
+            item_done = 0
+            item_failed = 0
+            item_total = len(item.tasks or ())
+            try:
+                state = self._state_for(item)
+                engine = DownloadEngine(
+                    concurrency=item.settings.file_concurrency,
+                    retries=item.settings.retry_count,
+                    retry_interval=item.settings.retry_interval,
+                    pause_event=self.pause_event,
+                    stop_event=self.stop_event,
+                    settings=item.settings,
+                )
+
+                def on_event(event: DownloadEvent) -> None:
+                    nonlocal item_done, item_failed
+                    if event.type == "file_retry":
+                        self.log.emit(event.message)
+                        return
+                    if event.type not in {
+                        "file_finished",
+                        "file_skipped",
+                        "file_cancelled",
+                        "file_failed",
+                    }:
+                        return
+                    item_done += 1
+                    self._done += 1
+                    failed = event.type == "file_failed"
+                    item.progress_done = item_done
+                    item.progress_total = item_total
+                    if failed:
+                        item_failed += 1
+                        self._failed += 1
+                        item.progress_failed = item_failed
+                        failed_item = self._failed_download(item, event)
+                        if failed_item is not None:
+                            self.failed_item.emit(failed_item)
+                        self.log.emit(f"失败: {event.file_name} - {event.message}")
+                    elif event.type == "file_finished":
+                        self.log.emit(f"完成: {event.file_name}")
+                    self.entry_progress.emit(item, item_done, item_total, item_failed)
+                    self.progress.emit(self._done, self._total, self._failed)
+
+                await engine.run(item.tasks or [], state, on_event)
+                if state is not None:
+                    state.flush()
+            except Exception as exc:
+                item.status = "error"
+                item.error = str(exc)
+                self.entry_changed.emit(item)
+                self.log.emit(f"下载列表任务出错: {item.post.title} - {exc}")
+                failed_posts += 1
+                continue
+
+            if self.stop_event.is_set():
+                item.status = "stopped"
+                item.error = "下载已停止"
+                stopped_posts += 1
+            elif item_failed:
+                item.status = "failed"
+                item.error = f"{item_failed} 个文件失败"
+                failed_posts += 1
+            else:
+                item.status = "completed"
+                item.error = ""
+                completed += 1
+            self.entry_changed.emit(item)
+
+        if self.stop_event.is_set():
+            message = f"下载列表已停止：完成 {completed} 条，失败 {failed_posts} 条，未完成 {stopped_posts} 条"
+        else:
+            suffix = f"，失败 {failed_posts} 条" if failed_posts else ""
+            message = f"下载列表处理完成：完成 {completed} 条{suffix}"
+        self.finished.emit(message)
+
+    def _state_for(self, item: QueueItem) -> StateStore:
+        key = (item.state_key, str(item.state_root))
+        state = self._states.get(key)
+        if state is None:
+            ensure_state_dir(item.program_root)
+            state = StateStore(item.state_key, root=item.state_root)
+            self._states[key] = state
+        return state
+
+    def _failed_download(self, item: QueueItem, event: DownloadEvent) -> FailedDownload | None:
+        data = event.data or {}
+        post = data.get("post")
+        file_item = data.get("file")
+        if not isinstance(post, PostItem) or not isinstance(file_item, FileItem):
+            return None
+        target = Path(str(data.get("target_path") or event.path or ""))
+        temp = Path(str(data.get("temp_path") or ""))
+        if not str(target) or not str(temp):
+            return None
+        return FailedDownload(
+            post=post,
+            file=file_item,
+            save_path=target,
+            temp_path=temp,
+            error=event.message or "下载失败",
+            state_key=item.state_key,
+            state_root=item.state_root,
+        )
 
 
 class RetryWorker(QObject):
@@ -2752,6 +3017,11 @@ class MainWindow(QMainWindow):
         self.posts: list[PostItem] = []
         self.loader: PostLoader | None = None
         self.worker: DownloadWorker | None = None
+        self.queue_worker: QueueDownloadWorker | None = None
+        self.queue_prepare_worker: QueuePrepareWorker | None = None
+        self._queue_items: list[QueueItem] = []
+        self._queue_preparing = False
+        self._loader_busy = False
         self.retry_worker: RetryWorker | None = None
         self._failed_items: dict[tuple[str, str, str], FailedDownload] = {}
         self._selected_post_ids: set[str] = set()
@@ -3197,9 +3467,10 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         buttons.setSpacing(10)
-        self.start_button = QPushButton("开始下载")
+        self.start_button = QPushButton("加入下载列表")
         self.start_button.setObjectName("primaryButton")
         style_button(self.start_button, 36, 148)
+        self.start_button.setToolTip("把当前勾选的帖子加入下载列表，不会立即下载")
         self.pause_button = QPushButton("暂停")
         self.pause_button.setObjectName("ghostButton")
         style_button(self.pause_button, 36, 88)
@@ -3209,7 +3480,7 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("停止")
         self.stop_button.setObjectName("dangerButton")
         style_button(self.stop_button, 36, 88)
-        self.start_button.clicked.connect(self._start_download)
+        self.start_button.clicked.connect(self._enqueue_selected)
         self.pause_button.clicked.connect(self._pause)
         self.resume_button.clicked.connect(self._resume)
         self.stop_button.clicked.connect(self._stop)
@@ -3219,7 +3490,7 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.resume_button)
         buttons.addWidget(self.stop_button)
         buttons.addStretch(1)
-        site_hint = QLabel("站点限制：同时下载 ≤5 · 约 1 请求/秒")
+        site_hint = QLabel("站点限制：同帖文件 ≤5 · 下载列表逐帖处理")
         site_hint.setObjectName("hintLabel")
         buttons.addWidget(site_hint)
         control_box.addLayout(buttons)
@@ -3301,6 +3572,63 @@ class MainWindow(QMainWindow):
         post_layout.addWidget(self.post_stack, stretch=1)
         self._apply_post_preview_mode(current_mode, rebuild=True)
         self.content_tabs.addTab(post_page, "帖子列表")
+
+        self.queue_page = QWidget()
+        queue_layout = QVBoxLayout(self.queue_page)
+        queue_layout.setContentsMargins(0, 8, 0, 0)
+        queue_layout.setSpacing(8)
+        queue_actions = QHBoxLayout()
+        queue_actions.setContentsMargins(0, 0, 0, 0)
+        queue_actions.setSpacing(8)
+        self.queue_hint = QLabel("下载列表为空：勾选帖子后点击“加入下载列表”。")
+        self.queue_hint.setObjectName("settingsHint")
+        self.queue_hint.setWordWrap(True)
+        queue_actions.addWidget(self.queue_hint, stretch=1)
+        self.queue_start_button = QPushButton("开始列表")
+        self.queue_start_button.setObjectName("primaryButton")
+        style_button(self.queue_start_button, 30, 96)
+        self.queue_start_button.setToolTip("按列表顺序逐条下载；同一时间只处理一条帖子")
+        self.queue_start_button.clicked.connect(self._start_queue)
+        self.queue_remove_button = QPushButton("移除选中")
+        self.queue_remove_button.setObjectName("ghostButton")
+        style_button(self.queue_remove_button, 30, 92)
+        self.queue_remove_button.setToolTip("从列表移除，保留已有断点缓存")
+        self.queue_remove_button.clicked.connect(self._remove_selected_queue_items)
+        self.queue_clear_button = QPushButton("清空列表")
+        self.queue_clear_button.setObjectName("dangerButton")
+        style_button(self.queue_clear_button, 30, 84)
+        self.queue_clear_button.setToolTip("清空列表并删除本轮预建的空白 .part 占位；不会删除已下载内容")
+        self.queue_clear_button.clicked.connect(self._clear_queue)
+        queue_actions.addWidget(self.queue_start_button)
+        queue_actions.addWidget(self.queue_remove_button)
+        queue_actions.addWidget(self.queue_clear_button)
+        queue_layout.addLayout(queue_actions)
+
+        self.queue_precreate_box = QCheckBox("加入列表时预建临时文件（仅创建空白 .part，不下载内容）")
+        self.queue_precreate_box.setChecked(bool(self.app_settings.queue_precreate_temps))
+        self.queue_precreate_box.setToolTip(
+            "提前确定文件名并建立 0 字节的 .part 占位，开始列表后从这里续传；"
+            "不会在加入列表时请求文件内容。"
+        )
+        self.queue_precreate_box.toggled.connect(self._on_queue_precreate_toggled)
+        queue_layout.addWidget(self.queue_precreate_box)
+
+        self.queue_list = QListWidget()
+        self.queue_list.setObjectName("queueList")
+        self.queue_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        queue_layout.addWidget(self.queue_list, stretch=1)
+        queue_footer = QLabel(
+            "列表按帖子逐条处理，避免同时开多个帖子的下载把帖子加载拖住；"
+            "移除只删列表项，已有断点缓存会保留。"
+        )
+        queue_footer.setObjectName("settingsHint")
+        queue_footer.setWordWrap(True)
+        queue_layout.addWidget(queue_footer)
+        self.queue_start_button.setEnabled(False)
+        self.queue_remove_button.setEnabled(False)
+        self.queue_clear_button.setEnabled(False)
+        self.content_tabs.addTab(self.queue_page, "下载列表")
 
         self.save_page = QWidget()
         self.content_tabs.addTab(self.save_page, "保存目录")
@@ -3641,9 +3969,11 @@ class MainWindow(QMainWindow):
         self.post_preview_panel.clear()
         self.posts = []
         self._selected_post_ids.clear()
+        self._loader_busy = True
         self.load_button.setEnabled(False)
         self.post_count_label.setText("加载中…")
-        self.summary_label.setText("正在加载帖子...")
+        if not getattr(self, "_running", False):
+            self.summary_label.setText("正在加载帖子...")
         self._log("开始加载帖子列表")
         self.loader = PostLoader(url, self.app_settings)
         self.loader.posts_loaded.connect(self._on_posts_loaded)
@@ -3663,14 +3993,20 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
         self.post_list.blockSignals(False)
         self._apply_post_preview_mode(self._current_preview_mode(), rebuild=True)
-        self.summary_label.setText(f"已加载 {len(posts)} 条帖子，默认全选")
         self.post_count_label.setText(f"{len(posts)} 条")
+        self._loader_busy = False
         self.load_button.setEnabled(True)
+        if getattr(self, "_running", False):
+            self._log(f"帖子列表已更新：{len(posts)} 条；下载列表进度不受影响")
+        else:
+            self.summary_label.setText(f"已加载 {len(posts)} 条帖子，默认全选")
 
     def _on_loader_error(self, message: str) -> None:
+        self._loader_busy = False
         self.load_button.setEnabled(True)
         self.post_count_label.setText("加载失败")
-        self.summary_label.setText("加载失败")
+        if not getattr(self, "_running", False):
+            self.summary_label.setText("加载失败")
         self._log(f"加载失败: {message}")
         MessageDialog.show_message(self, "加载失败", message, kind="error", theme=self.ui_theme)
 
@@ -3754,19 +4090,46 @@ class MainWindow(QMainWindow):
                 break
         self.post_list.blockSignals(False)
 
-    def _start_download(self) -> None:
+    def _enqueue_selected(self) -> None:
+        if getattr(self, "_running", False):
+            MessageDialog.show_message(
+                self, "下载列表运行中", "请先停止当前列表，再加入新的帖子。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        if self._queue_preparing:
+            MessageDialog.show_message(
+                self, "正在预建临时文件", "请等待当前预建完成后再加入帖子。",
+                kind="info", theme=self.ui_theme
+            )
+            return
         selected = self._selected_posts()
         root = self._save_root()
         program_root = self._program_root()
         url = self.url_input.text().strip()
         if not selected:
-            MessageDialog.show_message(self, "还没有选择帖子", "请至少勾选一条帖子再开始下载。", kind="info", theme=self.ui_theme)
+            MessageDialog.show_message(
+                self, "还没有选择帖子", "请至少勾选一条帖子再加入下载列表。",
+                kind="info", theme=self.ui_theme
+            )
             return
         if root is None:
-            MessageDialog.show_message(self, "还没有保存目录", "请先设置主保存目录，再开始下载。", kind="info", theme=self.ui_theme)
+            MessageDialog.show_message(
+                self, "还没有保存目录", "请先设置主保存目录，再加入下载列表。",
+                kind="info", theme=self.ui_theme
+            )
             return
         if program_root is None:
-            MessageDialog.show_message(self, "程序目录不可用", "主保存目录丢失，请重新设置。", kind="error", theme=self.ui_theme)
+            MessageDialog.show_message(
+                self, "程序目录不可用", "主保存目录丢失，请重新设置。",
+                kind="error", theme=self.ui_theme
+            )
+            return
+        if not url:
+            MessageDialog.show_message(
+                self, "还没有创作者 URL", "下载列表需要创作者 URL 来生成 State 记录。",
+                kind="info", theme=self.ui_theme
+            )
             return
         try:
             root.mkdir(parents=True, exist_ok=True)
@@ -3778,29 +4141,296 @@ class MainWindow(QMainWindow):
                 kind="error", theme=self.ui_theme
             )
             return
-        if str(root) != str(self._save_root()):
-            self._rebuild_save_path_combo(root)
-        self.failed_list.clear()
-        self._failed_items.clear()
-        self._update_failed_buttons()
-        self.progress.setValue(0)
-        self.progress.setMaximum(0)
-        self.summary_label.setText("正在准备下载任务...")
-        self._set_running(True)
 
-        self.worker = DownloadWorker(
-            creator_url=url,
-            posts=selected,
-            output_dir=root,
-            program_root=program_root,
-            settings=self.app_settings,
+        existing = {item.key for item in self._queue_items}
+        added: list[QueueItem] = []
+        skipped = 0
+        for post in selected:
+            item = QueueItem(
+                post=post,
+                creator_url=url,
+                output_dir=root,
+                program_root=program_root,
+                settings=self.app_settings.normalized(),
+                precreate=self.queue_precreate_box.isChecked(),
+                status="waiting",
+            )
+            if item.key in existing:
+                skipped += 1
+                continue
+            existing.add(item.key)
+            self._queue_items.append(item)
+            self._add_queue_row(item)
+            added.append(item)
+        if not added:
+            self._log(f"下载列表未变化：{skipped} 条帖子已在列表中")
+            self._refresh_queue_controls()
+            return
+        self._refresh_queue_controls()
+        self.content_tabs.setCurrentWidget(self.queue_page)
+        self._log(
+            f"已加入下载列表 {len(added)} 条帖子"
+            + (f"，跳过重复 {skipped} 条" if skipped else "")
         )
-        self.worker.log.connect(self._log)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.failed_item.connect(self._on_failed_item)
-        self.worker.finished.connect(self._on_download_finished)
-        self.worker.error.connect(self._on_download_error)
-        self.worker.start()
+        if added and self.queue_precreate_box.isChecked():
+            self._prepare_queue_items(added)
+
+    def _prepare_queue_items(self, items: list[QueueItem]) -> None:
+        pending = [item for item in items if item.tasks is None and item.precreate]
+        if not pending or self._queue_preparing:
+            return
+        self._queue_preparing = True
+        self.queue_prepare_worker = QueuePrepareWorker(pending)
+        self.queue_prepare_worker.log.connect(self._log)
+        self.queue_prepare_worker.item_changed.connect(self._on_queue_item_changed)
+        self.queue_prepare_worker.finished.connect(self._on_queue_prepare_finished)
+        self.queue_prepare_worker.error.connect(self._on_queue_prepare_error)
+        self.queue_prepare_worker.start()
+        self._refresh_queue_controls()
+
+    def _on_queue_prepare_finished(self, message: str) -> None:
+        self._queue_preparing = False
+        self._log(message)
+        self._update_queue_hint()
+        self._refresh_queue_controls()
+
+    def _on_queue_prepare_error(self, message: str) -> None:
+        self._queue_preparing = False
+        self._log(f"预建临时文件出错: {message}", danger=True)
+        self._update_queue_hint()
+        self._refresh_queue_controls()
+
+    def _start_queue(self) -> None:
+        if getattr(self, "_running", False):
+            return
+        if self._queue_preparing:
+            MessageDialog.show_message(
+                self, "正在预建临时文件", "请等待预建完成后再开始列表。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        pending = [item for item in self._queue_items if item.status != "completed"]
+        if not pending:
+            MessageDialog.show_message(
+                self, "下载列表为空", "请先把帖子加入下载列表。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        for item in pending:
+            try:
+                item.output_dir.mkdir(parents=True, exist_ok=True)
+                ensure_program_layout(item.program_root)
+                ensure_state_dir(item.program_root)
+            except OSError as exc:
+                MessageDialog.show_message(
+                    self, "保存目录不可用",
+                    f"无法准备下载目录：\n{item.output_dir}\n\n{exc}",
+                    kind="error", theme=self.ui_theme
+                )
+                return
+
+        self.progress.setMaximum(0)
+        self.progress.setValue(0)
+        self.summary_label.setText("正在开始下载列表...")
+        self._set_running(True)
+        self._refresh_queue_controls()
+        self._log(f"开始处理下载列表，共 {len(pending)} 条帖子")
+
+        self.queue_worker = QueueDownloadWorker(pending)
+        self.queue_worker.log.connect(self._log)
+        self.queue_worker.progress.connect(self._on_progress)
+        self.queue_worker.entry_changed.connect(self._on_queue_item_changed)
+        self.queue_worker.entry_progress.connect(self._on_queue_entry_progress)
+        self.queue_worker.failed_item.connect(self._on_failed_item)
+        self.queue_worker.finished.connect(self._on_queue_finished)
+        self.queue_worker.error.connect(self._on_queue_error)
+        self.queue_worker.start()
+
+    def _on_queue_finished(self, message: str) -> None:
+        self._log(message)
+        if self.failed_list.count():
+            root = self._program_root()
+            if root is not None:
+                failed_path = failed_export_path(root)
+                self._log(f"失败记录已导出: {failed_path}")
+        self.summary_label.setText(message)
+        self._set_running(False)
+        self._end_temp_extensions()
+        self._refresh_temp_view()
+        self._update_queue_hint()
+        self._refresh_queue_controls()
+        if self.content_tabs.currentWidget() is self.save_page:
+            self._refresh_save_view()
+
+    def _on_queue_error(self, message: str) -> None:
+        self._log(f"下载列表出错: {message}", danger=True)
+        self.summary_label.setText("下载列表出错")
+        self._set_running(False)
+        self._end_temp_extensions()
+        self._update_queue_hint()
+        self._refresh_queue_controls()
+        MessageDialog.show_message(self, "下载列表出错", message, kind="error", theme=self.ui_theme)
+
+    def _on_queue_item_changed(self, item: QueueItem) -> None:
+        self._refresh_queue_row(item)
+        self._update_queue_hint()
+        self._refresh_queue_controls()
+
+    def _on_queue_entry_progress(
+        self, item: QueueItem, done: int, total: int, failed: int
+    ) -> None:
+        item.progress_done = done
+        item.progress_total = total
+        item.progress_failed = failed
+        self._refresh_queue_row(item)
+        self.summary_label.setText(
+            f"下载中：{item.post.title} {done}/{total}" + (f"，失败 {failed}" if failed else "")
+        )
+
+    def _queue_row_text(self, item: QueueItem) -> str:
+        status = item.status_label
+        if item.status == "running" and item.progress_total:
+            status = f"{status} {item.progress_done}/{item.progress_total}"
+            if item.progress_failed:
+                status += f" · 失败 {item.progress_failed}"
+        head = f"{status}  ·  {item.post.day}  {item.post.title}"
+        if item.tasks is not None:
+            folder = item.post_folder.name if item.post_folder else item.output_dir.name
+            tail = f"{len(item.tasks)} 个文件  ·  {folder}"
+        else:
+            tail = f"{'等待预建' if item.precreate else '等待开始'}  ·  {item.output_dir.name}"
+        if item.error:
+            tail += f"\n{item.error}"
+        return f"{head}\n{tail}"
+
+    def _add_queue_row(self, item: QueueItem) -> None:
+        row = QListWidgetItem(self._queue_row_text(item))
+        row.setData(Qt.ItemDataRole.UserRole, item.key)
+        row.setToolTip(self._queue_tooltip(item))
+        self.queue_list.addItem(row)
+
+    def _refresh_queue_row(self, item: QueueItem) -> None:
+        for index in range(self.queue_list.count()):
+            row = self.queue_list.item(index)
+            if row.data(Qt.ItemDataRole.UserRole) == item.key:
+                row.setText(self._queue_row_text(item))
+                row.setToolTip(self._queue_tooltip(item))
+                return
+
+    def _queue_tooltip(self, item: QueueItem) -> str:
+        lines = [
+            item.post.title,
+            f"状态：{item.status_label}",
+            f"来源：{item.post.url}",
+            f"目标：{item.post_folder or item.output_dir}",
+        ]
+        if item.tasks is not None:
+            lines.append(f"文件：{len(item.tasks)} 个")
+        if item.error:
+            lines.append(f"错误：{item.error}")
+        return "\n".join(lines)
+
+    def _update_queue_hint(self) -> None:
+        if not hasattr(self, "queue_hint"):
+            return
+        total = len(self._queue_items)
+        if not total:
+            self.queue_hint.setText("下载列表为空：勾选帖子后点击“加入下载列表”。")
+            return
+        ready = sum(1 for item in self._queue_items if item.status in ("waiting", "ready"))
+        preparing = sum(1 for item in self._queue_items if item.status == "preparing")
+        running = sum(1 for item in self._queue_items if item.status == "running")
+        completed = sum(1 for item in self._queue_items if item.status == "completed")
+        failed = sum(1 for item in self._queue_items if item.status in ("failed", "error"))
+        parts = [f"共 {total} 条", f"待下载 {ready}"]
+        if preparing:
+            parts.append(f"预建中 {preparing}")
+        if running:
+            parts.append(f"下载中 {running}")
+        if completed:
+            parts.append(f"已完成 {completed}")
+        if failed:
+            parts.append(f"失败 {failed}")
+        self.queue_hint.setText(" · ".join(parts))
+
+    def _refresh_queue_controls(self) -> None:
+        if not hasattr(self, "queue_start_button"):
+            return
+        running = getattr(self, "_running", False)
+        pending = any(item.status != "completed" for item in self._queue_items)
+        self.queue_start_button.setEnabled(pending and not running and not self._queue_preparing)
+        self.queue_remove_button.setEnabled(bool(self._queue_items) and not running)
+        self.queue_clear_button.setEnabled(bool(self._queue_items) and not running)
+        self.queue_precreate_box.setEnabled(not running and not self._queue_preparing)
+        if hasattr(self, "start_button"):
+            self.start_button.setEnabled(not running and not self._queue_preparing)
+        self._update_queue_hint()
+
+    def _selected_queue_items(self) -> list[QueueItem]:
+        keys = {
+            row.data(Qt.ItemDataRole.UserRole)
+            for row in self.queue_list.selectedItems()
+        }
+        return [item for item in self._queue_items if item.key in keys]
+
+    def _remove_selected_queue_items(self) -> None:
+        if getattr(self, "_running", False):
+            return
+        selected = self._selected_queue_items()
+        if not selected:
+            MessageDialog.show_message(
+                self, "还没有选择列表项", "请在下载列表中多选要移除的帖子。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        keys = {item.key for item in selected}
+        for item in selected:
+            remove_temp_placeholders(item.tasks)
+        self._queue_items = [item for item in self._queue_items if item.key not in keys]
+        for index in range(self.queue_list.count() - 1, -1, -1):
+            row = self.queue_list.item(index)
+            if row.data(Qt.ItemDataRole.UserRole) in keys:
+                self.queue_list.takeItem(index)
+        self._log(f"已从下载列表移除 {len(selected)} 条帖子（保留已有断点缓存）")
+        self._refresh_queue_controls()
+
+    def _clear_queue(self) -> None:
+        if getattr(self, "_running", False) or not self._queue_items:
+            return
+        dialog = MessageDialog(
+            self,
+            "清空下载列表",
+            f"确定清空 {len(self._queue_items)} 条帖子吗？\n\n"
+            "只会删除列表项和本轮预建的空白 .part 占位；"
+            "已有断点缓存与已下载文件不会删除。",
+            kind="warning",
+            confirm=True,
+            theme=self.ui_theme,
+        )
+        dialog.exec()
+        if not dialog.confirmed:
+            return
+        count = len(self._queue_items)
+        for item in self._queue_items:
+            remove_temp_placeholders(item.tasks)
+        self._queue_items.clear()
+        self.queue_list.clear()
+        self._log(f"已清空下载列表：{count} 条帖子")
+        self._refresh_queue_controls()
+
+    def _on_queue_precreate_toggled(self, checked: bool) -> None:
+        self.app_settings.queue_precreate_temps = bool(checked)
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"预建临时文件设置保存失败: {exc}")
+        if checked and not getattr(self, "_running", False):
+            for item in self._queue_items:
+                item.precreate = True
+            self._prepare_queue_items(self._queue_items)
+        elif not checked:
+            for item in self._queue_items:
+                item.precreate = False
 
     def _selected_posts(self) -> list[PostItem]:
         return [post for post in self.posts if post.id in self._selected_post_ids]
@@ -3832,23 +4462,25 @@ class MainWindow(QMainWindow):
         self.post_preview_panel.request_visible(scroll, self.post_scroll.viewport().height())
 
     def _pause(self) -> None:
-        if self.worker:
-            self.worker.pause()
+        if self.queue_worker:
+            self.queue_worker.pause()
             self.pause_button.setEnabled(False)
             self.resume_button.setEnabled(True)
-            self._log("已暂停")
+            self._log("已暂停下载列表")
+            self.summary_label.setText("下载列表已暂停")
 
     def _resume(self) -> None:
-        if self.worker:
-            self.worker.resume()
+        if self.queue_worker:
+            self.queue_worker.resume()
             self.pause_button.setEnabled(True)
             self.resume_button.setEnabled(False)
-            self._log("已继续")
+            self._log("已继续下载列表")
 
     def _stop(self) -> None:
-        if self.worker:
-            self.worker.stop()
-            self._log("正在停止...")
+        if self.queue_worker:
+            self.queue_worker.stop()
+            self._log("正在停止下载列表...")
+            self.summary_label.setText("正在停止下载列表...")
 
     def _on_progress(self, done: int, total: int, failed: int) -> None:
         self.progress.setMaximum(total)
@@ -4054,8 +4686,8 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self._running = running
-        self.start_button.setEnabled(not running)
-        self.load_button.setEnabled(not running)
+        self.start_button.setEnabled(not running and not self._queue_preparing)
+        self.load_button.setEnabled(not self._loader_busy)
         self.settings_button.setEnabled(not running)
         if hasattr(self, "about_button"):
             self.about_button.setEnabled(not running)
@@ -4083,6 +4715,8 @@ class MainWindow(QMainWindow):
             self.open_dir_button.setEnabled(not running and self._save_root() is not None)
         if hasattr(self, "_update_failed_buttons"):
             self._update_failed_buttons()
+        if hasattr(self, "_refresh_queue_controls"):
+            self._refresh_queue_controls()
 
     def _temp_root(self) -> Path | None:
         return resolve_temp_root(self.app_settings, self._program_root())
@@ -4151,8 +4785,11 @@ class MainWindow(QMainWindow):
             self._refresh_temp_view()
 
     def _on_content_tab_changed(self, index: int) -> None:
-        if self.content_tabs.widget(index) is self.save_page:
+        widget = self.content_tabs.widget(index)
+        if widget is self.save_page:
             self._refresh_save_view()
+        elif widget is self.queue_page:
+            self._update_queue_hint()
         else:
             QTimer.singleShot(0, self._load_visible_thumbnails)
 
@@ -4700,6 +5337,10 @@ class MainWindow(QMainWindow):
         apply_title_bar(self, self.ui_theme)
 
     def closeEvent(self, event) -> None:
+        if self.queue_worker:
+            self.queue_worker.stop()
+        if self.queue_prepare_worker:
+            self.queue_prepare_worker.stop()
         if self.worker:
             self.worker.stop()
         event.accept()

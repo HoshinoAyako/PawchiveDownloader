@@ -86,6 +86,8 @@ class DownloadService:
         post: PostItem,
         output_dir: Path,
         naming_mode: DateNamingMode,
+        *,
+        write_marker: bool = True,
     ) -> list[DownloadTask]:
         output_dir.mkdir(parents=True, exist_ok=True)
         files = await self.api.get_post_files(post)
@@ -103,7 +105,9 @@ class DownloadService:
                 item.content = build_content_text(post, files, external_links=[])
                 break
 
-        post_dir = self._resolve_post_dir(output_dir, post, naming_mode)
+        post_dir = self._resolve_post_dir(
+            output_dir, post, naming_mode, write_marker=write_marker
+        )
         temp_root = self.temp_root or (output_dir / ".pawchive_tmp")
         temp_dir = temp_root / post_dir.name
         tasks: list[DownloadTask] = []
@@ -119,10 +123,20 @@ class DownloadService:
             )
         return tasks
 
-    def _resolve_post_dir(self, output_dir: Path, post: PostItem, naming_mode: DateNamingMode) -> Path:
+    def _resolve_post_dir(
+        self,
+        output_dir: Path,
+        post: PostItem,
+        naming_mode: DateNamingMode,
+        *,
+        write_marker: bool = True,
+    ) -> Path:
         key = f"{post.service}:{post.user_id}:{post.id}"
         if key in self._reserved_post_dirs:
-            return self._reserved_post_dirs[key]
+            post_dir = self._reserved_post_dirs[key]
+            if write_marker:
+                self._write_marker(post_dir, post.id)
+            return post_dir
 
         base_name = post_folder_name(post, naming_mode)
         base_path = output_dir / base_name
@@ -131,19 +145,45 @@ class DownloadService:
 
         while candidate.exists() or candidate in self._reserved_paths:
             marker = candidate / ".post_id"
+            queue_marker = candidate / ".pawchive_queue"
             if marker.exists():
                 try:
                     if marker.read_text(encoding="utf-8").strip() == post.id:
                         break
                 except Exception:
                     pass
+                candidate = output_dir / f"{base_name}_{suffix}"
+                suffix += 1
+                continue
+            if queue_marker.exists():
+                try:
+                    if queue_marker.read_text(encoding="utf-8").strip() == post.id:
+                        break
+                except Exception:
+                    pass
+                candidate = output_dir / f"{base_name}_{suffix}"
+                suffix += 1
+                continue
             candidate = output_dir / f"{base_name}_{suffix}"
             suffix += 1
 
         candidate.mkdir(parents=True, exist_ok=True)
-        marker = candidate / ".post_id"
-        if not marker.exists():
-            marker.write_text(post.id, encoding="utf-8")
+        if write_marker:
+            self._write_marker(candidate, post.id)
+            try:
+                (candidate / ".pawchive_queue").unlink(missing_ok=True)
+            except OSError:
+                pass
+        elif not (candidate / ".post_id").exists():
+            queue_marker = candidate / ".pawchive_queue"
+            if not queue_marker.exists():
+                queue_marker.write_text(post.id, encoding="utf-8")
         self._reserved_post_dirs[key] = candidate
         self._reserved_paths.add(candidate)
         return candidate
+
+    @staticmethod
+    def _write_marker(post_dir: Path, post_id: str) -> None:
+        marker = post_dir / ".post_id"
+        if not marker.exists():
+            marker.write_text(post_id, encoding="utf-8")

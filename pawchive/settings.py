@@ -395,6 +395,8 @@ class AppSettings:
     attachment_types: tuple[str, ...] = ()
     # 是否下载图片附件；旧配置缺少此字段时按 True 处理，保持原有“图片始终下载”行为。
     include_images: bool = True
+    # 加入下载列表时是否建立空白 .part 占位；不提前下载文件内容。
+    queue_precreate_temps: bool = True
     extra_extensions: tuple[str, ...] = ()
     # 仅本次任务生效的自定义扩展名开关；勾了“其他未知扩展名”时无需它。
     temp_custom_extensions: bool = False
@@ -454,6 +456,7 @@ class AppSettings:
             proxy_address=self.proxy_address,
             attachment_types=self.attachment_types,
             include_images=self.include_images,
+            queue_precreate_temps=self.queue_precreate_temps,
             extra_extensions=self.extra_extensions if "other" in self.attachment_types else (),
             temp_custom_extensions=False,
             announcement_dismissed_version=self.announcement_dismissed_version,
@@ -528,6 +531,7 @@ class AppSettings:
             proxy_address=address,
             attachment_types=types,
             include_images=bool(self.include_images),
+            queue_precreate_temps=bool(self.queue_precreate_temps),
             extra_extensions=extras,
             temp_custom_extensions=temp_enabled,
             announcement_dismissed_version=str(self.announcement_dismissed_version or "").strip()[:32],
@@ -553,6 +557,7 @@ def _settings_from_dict(data: dict) -> AppSettings:
         proxy_address=str(data.get("proxy_address", "") or ""),
         attachment_types=data.get("attachment_types", ()) or (),
         include_images=bool(data.get("include_images", True)),
+        queue_precreate_temps=bool(data.get("queue_precreate_temps", True)),
         extra_extensions=data.get("extra_extensions", ()) or (),
         temp_custom_extensions=bool(data.get("temp_custom_extensions", False)),
         announcement_dismissed_version=str(data.get("announcement_dismissed_version", "") or ""),

@@ -517,6 +517,226 @@ def test_temp_clear_gui() -> None:
         app.processEvents()
 
 
+def test_download_queue() -> None:
+    import asyncio
+
+    from pawchive.downloader.models import FileItem, PostItem
+    from pawchive.downloader.queue import (
+        QueueItem,
+        build_queue_tasks,
+        create_temp_placeholders,
+        ensure_post_marker,
+        remove_temp_placeholders,
+    )
+    from pawchive.settings import AppSettings
+
+    class FakeApi:
+        async def get_post_files(self, post: PostItem) -> list[FileItem]:
+            return [
+                FileItem("https://example.invalid/pic.png", "pic.png", "image"),
+                FileItem("https://example.invalid/doc.pdf", "doc.pdf", "file"),
+            ]
+
+        async def get_post_content(self, post: PostItem) -> str:
+            return "<p>body</p>"
+
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_queue_") as temp:
+        settings = AppSettings(
+            output_dir=temp,
+            attachment_types=("document",),
+            include_images=True,
+            queue_precreate_temps=True,
+        ).normalized()
+        root = Path(settings.output_dir)
+        item = QueueItem(
+            post=PostItem("1", "queued", "2026-01-01T00:00:00", "https://example.invalid", "1", "fanbox"),
+            creator_url="https://pawchive.pw/fanbox/user/1",
+            output_dir=root,
+            program_root=root,
+            settings=settings,
+            precreate=True,
+        )
+        tasks = asyncio.run(build_queue_tasks(item, FakeApi()))
+        assert_true(len(tasks) == 3, "队列任务数错误")
+        assert_true(item.status == "ready", "预建后状态错误")
+        assert_true(item.progress_total == 3, "队列进度总数错误")
+        post_dir = tasks[0].save_path.parent
+        assert_true(not (post_dir / ".post_id").exists(), "预建阶段不应写 .post_id")
+        assert_true(
+            (post_dir / ".pawchive_queue").read_text(encoding="utf-8") == "1",
+            "预建占位标记错误",
+        )
+        created = create_temp_placeholders(tasks)
+        assert_true(created == 3, "临时文件占位创建数量错误")
+        assert_true(
+            all(task.temp_path.exists() and task.temp_path.stat().st_size == 0 for task in tasks),
+            "预建 .part 应为空文件",
+        )
+        ensure_post_marker(item)
+        assert_true((post_dir / ".post_id").exists(), "开始下载前未补写 .post_id")
+        assert_true(not (post_dir / ".pawchive_queue").exists(), "下载后残留队列标记")
+        removed = remove_temp_placeholders(tasks)
+        assert_true(removed == 3, "空白占位清理数量错误")
+        assert_true(post_dir.exists(), "已有 .post_id 的帖子目录不应被删除")
+
+        partial = tasks[0]
+        partial.temp_path.parent.mkdir(parents=True, exist_ok=True)
+        partial.temp_path.write_bytes(b"partial")
+        assert_true(remove_temp_placeholders(tasks) == 0, "断点缓存不应被当作空白占位删除")
+        assert_true(partial.temp_path.exists(), "断点缓存被误删")
+
+        other = QueueItem(
+            post=PostItem("2", "queued", "2026-01-01T00:00:00", "https://example.invalid", "1", "fanbox"),
+            creator_url="https://pawchive.pw/fanbox/user/1",
+            output_dir=root,
+            program_root=root,
+            settings=settings,
+            precreate=True,
+        )
+        other_tasks = asyncio.run(build_queue_tasks(other, FakeApi()))
+        assert_true(
+            other_tasks[0].save_path.parent != post_dir,
+            "不同帖子不应复用已带 .post_id 的同名目录",
+        )
+
+
+def test_queue_worker() -> None:
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from pawchive.app import gui
+    from pawchive.downloader.models import FileItem, PostItem
+    from pawchive.downloader.queue import QueueItem, build_queue_tasks, create_temp_placeholders
+    from pawchive.settings import AppSettings
+
+    payloads = {
+        "a.bin": b"queue-a" * 1024,
+        "b.bin": b"queue-b" * 2048,
+    }
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_queue_run_") as temp:
+        web = Path(temp) / "web"
+        web.mkdir()
+        for name, payload in payloads.items():
+            (web / name).write_bytes(payload)
+        handler = lambda *args, **kwargs: QuietHandler(  # noqa: E731
+            *args, directory=str(web), **kwargs
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            settings = AppSettings(
+                output_dir=str(Path(temp) / "downloads"),
+                attachment_types=("other",),
+                file_concurrency=1,
+                queue_precreate_temps=True,
+            ).normalized()
+            root = Path(settings.output_dir)
+            post = PostItem(
+                "q1", "Queue worker", "2026-01-01T00:00:00",
+                "https://example.invalid", "1", "fanbox",
+            )
+            item = QueueItem(
+                post=post,
+                creator_url="https://pawchive.pw/fanbox/user/1",
+                output_dir=root,
+                program_root=root,
+                settings=settings,
+                precreate=True,
+            )
+
+            class FakeApi:
+                async def get_post_files(self, post: PostItem) -> list[FileItem]:
+                    return [
+                        FileItem(f"{base_url}/a.bin", "a.bin", "file"),
+                        FileItem(f"{base_url}/b.bin", "b.bin", "file"),
+                    ]
+
+                async def get_post_content(self, post: PostItem) -> str:
+                    return "<p>queue body</p>"
+
+            tasks = asyncio.run(build_queue_tasks(item, FakeApi()))
+            create_temp_placeholders(tasks)
+            app = QApplication.instance() or QApplication([])
+            worker = gui.QueueDownloadWorker([item])
+            messages: list[str] = []
+            worker.finished.connect(messages.append)
+            worker.error.connect(messages.append)
+            asyncio.run(worker._main())
+
+            assert_true(item.status == "completed", f"队列状态错误: {item.status} {item.error}")
+            assert_true(any("完成 1 条" in message for message in messages), "队列完成消息错误")
+            for name, payload in payloads.items():
+                target = next(task.save_path for task in tasks if task.file.name == name)
+                assert_true(target.read_bytes() == payload, f"队列下载内容错误: {name}")
+            content = next(task.save_path for task in tasks if task.file.name == "content.txt")
+            assert_true("queue body" in content.read_text(encoding="utf-8"), "队列正文写入错误")
+            assert_true(item.post_folder is not None and (item.post_folder / ".post_id").exists(), "队列未写帖子标记")
+            assert_true(
+                all(not task.temp_path.exists() for task in tasks),
+                "队列完成后仍有 .part 临时文件",
+            )
+            app.processEvents()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+
+def test_queue_gui() -> None:
+    from PyQt6.QtWidgets import QApplication
+
+    from pawchive.app import gui
+    from pawchive.downloader.models import PostItem
+    from pawchive.settings import AppSettings
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_queue_gui_") as temp:
+        settings = AppSettings(
+            output_dir=temp,
+            queue_precreate_temps=False,
+        ).normalized()
+        original_load = gui.load_settings
+        original_save = gui.save_settings
+        gui.load_settings = lambda: settings
+        gui.save_settings = lambda *args, **kwargs: None
+        try:
+            window = gui.MainWindow(gui.load_app_font())
+            posts = [
+                PostItem(str(index), f"Queue {index}", f"2026-11-0{index}T12:00:00",
+                         "https://example.invalid", "1", "fanbox")
+                for index in range(1, 3)
+            ]
+            window._on_posts_loaded(posts)
+            window.url_input.setText("https://pawchive.pw/fanbox/user/1")
+            window.queue_precreate_box.setChecked(False)
+            window._enqueue_selected()
+            assert_true(window.start_button.text() == "加入下载列表", "主按钮仍为立即下载")
+            assert_true(window.queue_worker is None, "加入列表不应立即启动下载")
+            assert_true(window.queue_list.count() == 2, "下载列表行数错误")
+            assert_true(len(window._queue_items) == 2, "下载列表项数错误")
+            assert_true(
+                all(item.status == "waiting" and item.tasks is None for item in window._queue_items),
+                "未勾选预建时队列状态错误",
+            )
+            assert_true(window.queue_start_button.isEnabled(), "有队列项时开始列表不可用")
+            window._set_running(True)
+            assert_true(window.load_button.isEnabled(), "下载期间应允许继续加载帖子")
+            assert_true(not window.start_button.isEnabled(), "下载期间不应允许继续入队")
+            window._set_running(False)
+            window.queue_list.item(0).setSelected(True)
+            window._remove_selected_queue_items()
+            assert_true(window.queue_list.count() == 1, "移除选中队列项失败")
+            window.close()
+        finally:
+            gui.load_settings = original_load
+            gui.save_settings = original_save
+        app.processEvents()
+
+
 def test_attachment_selection() -> None:
     import asyncio
     import json
@@ -567,11 +787,20 @@ def test_attachment_selection() -> None:
         )
         old = load_settings(path)
         assert_true(old.include_images, "旧配置缺少 include_images 时应默认下载图片")
+        assert_true(old.queue_precreate_temps, "旧配置缺少 queue_precreate_temps 时应默认预建")
         from pawchive.settings import save_settings
 
-        save_settings(AppSettings(attachment_types=("design",), include_images=False), path)
+        save_settings(
+            AppSettings(
+                attachment_types=("design",),
+                include_images=False,
+                queue_precreate_temps=False,
+            ),
+            path,
+        )
         saved = load_settings(path)
         assert_true(not saved.include_images, "include_images 未持久化")
+        assert_true(not saved.queue_precreate_temps, "queue_precreate_temps 未持久化")
 
 
 def test_preview_modes() -> None:
@@ -662,6 +891,9 @@ def main() -> int:
         ("temp-cleanup", test_temp_cleanup),
         ("temp-clean-options", test_temp_clean_options),
         ("settings-clear-cache", test_settings_clear_cache),
+        ("download-queue", test_download_queue),
+        ("queue-worker", test_queue_worker),
+        ("queue-gui", test_queue_gui),
         ("attachment-selection", test_attachment_selection),
         ("temp-clear-gui", test_temp_clear_gui),
         ("state-discard", test_state_discard),
