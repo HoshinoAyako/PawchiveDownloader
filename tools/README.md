@@ -35,7 +35,7 @@ GitHub Actions 在 `.github/workflows/ci.yml` 中运行烟雾测试，上传 `bu
 ## Release 校验文件
 
 ```powershell
-python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.10.0.exe
+python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.10.1.exe
 ```
 
 输出 `dist\SHA256SUMS.txt`。发布时把 exe 和校验文件一起上传到 GitHub Release；程序更新器会拒绝没有校验信息的更新包。

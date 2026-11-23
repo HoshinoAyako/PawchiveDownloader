@@ -7,13 +7,13 @@ import os
 import queue
 import re
 import shutil
-import ssl
 import sys
 import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+
+import aiohttp
 
 from PyQt6.QtCore import QObject, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
@@ -87,6 +87,7 @@ from pawchive.image_audit import (
     audit_preview_images,
     replace_preview_images,
 )
+from pawchive.net import build_network_options
 from pawchive.release_notes import version_announcement_text
 from pawchive.updater import (
     PROJECT_URL,
@@ -289,33 +290,38 @@ class ThumbnailLoader(QObject):
             self._queue.put(None)
 
     def _worker(self) -> None:
-        proxy_url = self.settings.proxy_url() if self.settings.uses_proxy else None
-        if proxy_url and self.settings.proxy_type in ("http", "https"):
-            proxy = ProxyHandler({"http": proxy_url, "https": proxy_url})
-        else:
-            proxy = ProxyHandler({})
-        https = HTTPSHandler(context=ssl.create_default_context())
-        opener = build_opener(proxy, https)
-        while True:
-            url = self._queue.get()
-            if url is None:
-                return
-            try:
-                request = Request(
-                    url,
-                    headers={
-                        "User-Agent": f"PawchiveDownloader/{APP_VERSION}",
-                        "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
-                        "Referer": "https://pawchive.pw/",
-                    },
-                )
-                with opener.open(request, timeout=20) as response:
-                    data = response.read(self._MAX_BYTES + 1)
-                if not data or len(data) > self._MAX_BYTES:
-                    raise ValueError("缩略图内容为空或超过大小上限")
-                self.loaded.emit(url, data)
-            except BaseException:
-                self.failed.emit(url)
+        try:
+            asyncio.run(self._worker_async())
+        except BaseException:
+            return
+
+    async def _worker_async(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=25, sock_connect=15, sock_read=20)
+        headers = {
+            "User-Agent": f"PawchiveDownloader/{APP_VERSION}",
+            "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+        }
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout,
+            **build_network_options(self.settings),
+        ) as session:
+            while True:
+                url = self._queue.get()
+                if url is None:
+                    return
+                try:
+                    async with session.get(
+                        url, headers={"Referer": "https://pawchive.pw/"}
+                    ) as response:
+                        if response.status not in (200, 206):
+                            raise ValueError(f"HTTP {response.status}")
+                        data = await response.content.read(self._MAX_BYTES + 1)
+                    if not data or len(data) > self._MAX_BYTES:
+                        raise ValueError("缩略图内容为空或超过大小上限")
+                    self.loaded.emit(url, data)
+                except BaseException:
+                    self.failed.emit(url)
 
 
 class PreviewCard(QFrame):
