@@ -14,6 +14,7 @@ from .models import DownloadTask, PostItem
 
 SAVE_INTERVAL = 0.75
 STATE_DIR_NAME = "State"
+STATE_KEY_PREFIX = "pawchive_"
 _SAVE_LOCK = threading.Lock()
 
 
@@ -59,6 +60,30 @@ def migrate_legacy_state(target: Path) -> int:
     return moved
 
 
+def migrate_state_prefix(target: Path) -> int:
+    """把旧版 State 文件名前缀统一迁移为 ``pawchive_``。
+
+    State 目录只存放本程序的状态记录；新前缀文件已存在时保留新文件。
+    """
+    target = Path(target)
+    moved = 0
+    for item in sorted(target.glob("*.json"), key=lambda path: path.name.casefold()):
+        if item.name.startswith(STATE_KEY_PREFIX):
+            continue
+        parts = item.name.split("_", 1)
+        if len(parts) != 2 or not parts[1]:
+            continue
+        destination = target / f"{STATE_KEY_PREFIX}{parts[1]}"
+        if destination.exists():
+            continue
+        try:
+            item.replace(destination)
+            moved += 1
+        except OSError:
+            continue
+    return moved
+
+
 def ensure_state_dir(output_dir: Path | str | None, *, migrate_legacy: bool = True) -> Path | None:
     """创建新的 State 目录，并默认迁移旧版 AppData 下载记录。"""
     target = state_dir_for(output_dir)
@@ -67,6 +92,7 @@ def ensure_state_dir(output_dir: Path | str | None, *, migrate_legacy: bool = Tr
     target.mkdir(parents=True, exist_ok=True)
     if migrate_legacy:
         migrate_legacy_state(target)
+    migrate_state_prefix(target)
     return target
 
 

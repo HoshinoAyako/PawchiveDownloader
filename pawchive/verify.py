@@ -14,8 +14,8 @@ from pathlib import Path
 
 from PyQt6.QtGui import QImageReader
 
-from kemono_downloader.downloader.state import state_dir_for
-from kemono_downloader.settings import IMAGE_EXTENSIONS
+from pawchive.downloader.state import state_dir_for
+from pawchive.settings import IMAGE_EXTENSIONS
 
 MAX_IMAGE_DEEP_CHECK = 96 * 1024 * 1024
 

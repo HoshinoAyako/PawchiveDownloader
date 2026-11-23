@@ -14,7 +14,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kemono_downloader.settings import (
+from pawchive.settings import (
     program_config_path,
     program_log_dir,
     program_temp_root,

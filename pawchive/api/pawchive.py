@@ -6,12 +6,12 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from kemono_downloader.config import INCLUDE_OTHER_ATTACHMENTS
-from kemono_downloader.downloader.models import FileItem, PostItem
-from kemono_downloader.downloader.naming import is_image_name, sanitize_filename
-from kemono_downloader.net import build_network_options
-from kemono_downloader.settings import AppSettings
-from kemono_downloader.version import APP_VERSION
+from pawchive.config import INCLUDE_OTHER_ATTACHMENTS
+from pawchive.downloader.models import FileItem, PostItem
+from pawchive.downloader.naming import is_image_name, sanitize_filename
+from pawchive.net import build_network_options
+from pawchive.settings import AppSettings
+from pawchive.version import APP_VERSION
 
 
 USER_AGENT = f"PawchiveDownloader/{APP_VERSION}"
@@ -21,7 +21,7 @@ DATA_BASE = "https://file.pawchive.pw/data"
 PREVIEW_DATA_BASE = "https://img.pawchive.pw/thumbnail/data"
 PAGINATION_END_STATUSES = {400, 404}
 DEFAULT_HEADERS = {
-    # Kemono/DDG currently rejects or misbehaves with normal SPA/JSON-looking
+    # Pawchive/DDG currently rejects or misbehaves with normal SPA/JSON-looking
     # requests, so keep this odd Accept header for scraping/API calls.
     "Accept": "text/css",
     "User-Agent": USER_AGENT,
@@ -43,7 +43,7 @@ class ImageSource(Enum):
             raise ValueError(f"未知图片源模式: {value}") from exc
 
 
-class KemonoApi:
+class PawchiveApi:
     def __init__(
         self,
         timeout: int = 30,
@@ -163,7 +163,7 @@ class KemonoApi:
 
 
 def extract_post(data: object) -> dict:
-    """兼容两种详情响应: Kemono 的 {"post": {...}} 与 Pawchive 的扁平帖子对象。"""
+    """兼容两种详情响应：嵌套 {"post": {...}} 与扁平帖子对象。"""
     if not isinstance(data, dict):
         return {}
     post = data.get("post")

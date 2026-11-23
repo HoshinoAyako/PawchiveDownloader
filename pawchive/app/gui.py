@@ -51,26 +51,26 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from kemono_downloader.api.kemono import KemonoApi, normalize_creator_path
-from kemono_downloader.downloader.engine import DownloadEngine
-from kemono_downloader.downloader.models import DateNamingMode, DownloadEvent, PostItem
-from kemono_downloader.downloader.service import DownloadService
-from kemono_downloader.downloader.state import StateStore, ensure_state_dir, state_dir_for
-from kemono_downloader.downloader.temp import (
+from pawchive.api.pawchive import PawchiveApi, normalize_creator_path
+from pawchive.downloader.engine import DownloadEngine
+from pawchive.downloader.models import DateNamingMode, DownloadEvent, PostItem
+from pawchive.downloader.service import DownloadService
+from pawchive.downloader.state import StateStore, ensure_state_dir, state_dir_for
+from pawchive.downloader.temp import (
     clear_temp_root,
     iter_part_files,
     iter_temp_entries,
     migrate_program_root,
 )
-from kemono_downloader.image_audit import (
+from pawchive.image_audit import (
     PreviewAuditResult,
     PreviewCandidate,
     audit_preview_images,
     replace_preview_images,
 )
-from kemono_downloader.release_notes import version_announcement_text
-from kemono_downloader.selfcheck import needs_self_check, run_self_check
-from kemono_downloader.verify import (
+from pawchive.release_notes import version_announcement_text
+from pawchive.selfcheck import needs_self_check, run_self_check
+from pawchive.verify import (
     STATUS_LABELS,
     SavedPost,
     SaveScan,
@@ -79,7 +79,7 @@ from kemono_downloader.verify import (
     scan_save_root,
     verify_save_root,
 )
-from kemono_downloader.settings import (
+from pawchive.settings import (
     ATTACHMENT_CATEGORIES,
     ATTACHMENT_CATEGORY_EXTS,
     ATTACHMENT_CATEGORY_KEYS,
@@ -107,20 +107,20 @@ from kemono_downloader.settings import (
     save_settings,
     storage_paths_overlap,
 )
-from kemono_downloader.theme import (
+from pawchive.theme import (
     THEME_KEYS,
     THEME_LABELS,
     apply_title_bar,
     resolve_theme,
 )
-from kemono_downloader.app.style import (
+from pawchive.app.style import (
     announcement_qss,
     main_qss,
     message_qss,
     palette_for,
     settings_qss,
 )
-from kemono_downloader.version import APP_NAME, APP_VERSION
+from pawchive.version import APP_NAME, APP_VERSION
 
 
 ASSET_DIR = Path(__file__).resolve().parents[2] / "assets"
@@ -1106,7 +1106,7 @@ class PostLoader(QObject):
 
     async def _main(self) -> list[PostItem]:
         self.log.emit("正在读取帖子列表...")
-        service = DownloadService(KemonoApi(settings=self.settings, image_source=self.settings.image_source))
+        service = DownloadService(PawchiveApi(settings=self.settings, image_source=self.settings.image_source))
         posts = await service.list_posts(self.url)
         self.log.emit(f"读取完成，共 {len(posts)} 条帖子")
         return posts
@@ -1234,11 +1234,11 @@ class DownloadWorker(QObject):
             self.failed_export_path.unlink()
 
         service = DownloadService(
-            KemonoApi(settings=self.settings, image_source=self.settings.image_source),
+            PawchiveApi(settings=self.settings, image_source=self.settings.image_source),
             temp_root=resolve_temp_root(self.settings, self.program_root),
         )
         state_root = ensure_state_dir(self.program_root)
-        state_key = f"kemono_{normalize_creator_path(self.creator_url)}"
+        state_key = f"pawchive_{normalize_creator_path(self.creator_url)}"
         if path_key(self.output_dir) != path_key(self.program_root):
             digest = hashlib.sha1(
                 path_key(self.output_dir).encode("utf-8", "ignore")

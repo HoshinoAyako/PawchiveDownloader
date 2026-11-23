@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import AsyncIterator
 
-from kemono_downloader.api.base import PlatformApi
+from pawchive.api.base import PlatformApi
 
 from .content import build_content_text
 from .models import DateNamingMode, DownloadTask, FileItem, PostItem

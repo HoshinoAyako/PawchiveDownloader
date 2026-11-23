@@ -1,4 +1,4 @@
-from kemono_downloader.app.gui import main
+from pawchive.app.gui import main
 
 
 if __name__ == "__main__":

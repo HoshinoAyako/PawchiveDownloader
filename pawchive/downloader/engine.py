@@ -23,7 +23,7 @@ from ..settings import AppSettings
 
 
 # Pawchive 的文件 CDN 会拦截伪装成浏览器的 UA（返回 403），要求可识别的 UA。
-USER_AGENT = "PawchiveDownloader/1.0 (+https://github.com/slbidd/KemonoDownloaderGUI)"
+USER_AGENT = "PawchiveDownloader/1.0 (+https://github.com/HoshinoAyako/PawchiveDownloader)"
 DOWNLOAD_HEADERS = {"User-Agent": USER_AGENT}
 EventCallback = Callable[[DownloadEvent], None | Awaitable[None]]
 

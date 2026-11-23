@@ -18,15 +18,15 @@ from typing import Callable
 import aiofiles
 import aiohttp
 
-from kemono_downloader.api.kemono import (
+from pawchive.api.pawchive import (
     DATA_BASE,
     DEFAULT_HEADERS,
     PREVIEW_DATA_BASE,
 )
-from kemono_downloader.downloader.engine import replace_final_file
-from kemono_downloader.net import build_network_options
-from kemono_downloader.settings import AppSettings, IMAGE_EXTENSIONS
-from kemono_downloader.verify import is_under, path_key
+from pawchive.downloader.engine import replace_final_file
+from pawchive.net import build_network_options
+from pawchive.settings import AppSettings, IMAGE_EXTENSIONS
+from pawchive.verify import is_under, path_key
 
 
 @dataclass(slots=True)

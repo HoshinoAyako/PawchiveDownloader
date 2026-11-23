@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from kemono_downloader.downloader.models import FileItem, PostItem
+from pawchive.downloader.models import FileItem, PostItem
 
 
 class PlatformApi(Protocol):

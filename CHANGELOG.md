@@ -8,6 +8,14 @@
 
 示例：`1.1.0` 修一个下载 Bug → `1.1.1`；新增断点续传策略 → `1.2.0`；整体重写下载框架 → `2.0.0`。
 
+## 1.8.1 — 2026-11-23
+
+类型：小修改（PATCH）
+
+- 内部 Python 包目录统一为 `pawchive/`，API 模块与类型改为 `api/pawchive.py`、`PawchiveApi`，移除代码中残留的旧包名。
+- 新下载记录的 State 文件前缀改为 `pawchive_`；启动时自动迁移旧前缀记录，已有新记录不会被覆盖。
+- CLI 默认输出目录名改为 `pawchive_<creator>`；文件下载 UA 的说明链接指向当前仓库。
+
 ## 1.8.0 — 2026-11-23
 
 类型：新功能 / 新结构（MINOR）
@@ -24,7 +32,7 @@
 类型：小修改（PATCH）
 
 - 程序文件名统一首字母大写：`Config\Settings.json`、`Config\Log\Failed_Downloads.txt`。
-- 旧 `Config\Legacy\KemonoDownloader\meta` 归档收拢为 `Config\Meta`。
+- 旧版 `Config\Legacy` 归档路径收拢为 `Config\Meta`。
 - 升级时自动迁移旧 `settings.json`、`failed_downloads.txt`，原有设置和失败记录保留。
 
 ## 1.7.0 — 2026-11-23
@@ -71,7 +79,7 @@
 - 保存目录页新增“校验完整性”：对照下载记录检查缺失、空文件、记录大小不符，完整解码图片，检查 `content.txt` 是否为有效 UTF-8；异常项以红色标出并汇总。
 - 临时目录页新增“清理”按钮：确认后只删除 `<临时根>/<帖子目录>/*.part`，保留成品文件和其他文件；下载进行中禁止清理。
 - 顶部保存目录行新增“打开目录”按钮，直接打开当前保存目录；目录不存在时提示，不隐式创建。
-- 新增 `kemono_downloader/verify.py` 与保存目录树样式，统一深浅色主题。
+- 新增 `pawchive/verify.py` 与保存目录树样式，统一深浅色主题。
 
 ## 1.2.0 — 2026-11-23
 
@@ -103,7 +111,7 @@
 
 类型：项目更名与界面重构（MAJOR，相对旧 4.3.1 基线）
 
-- 项目由 KemonoDownloader 更名为 Pawchive Downloader，站点切换到 `pawchive.pw`。
+- 项目早期版本名统一为 Pawchive Downloader，站点切换到 `pawchive.pw`。
 - 设置持久化、附件类型筛选、代理配置。
 - 浅色 / 深色 / 跟随系统主题与自绘标题栏。
 - 公告弹窗增加“下次版本更新前不再提示”，按版本号生效。

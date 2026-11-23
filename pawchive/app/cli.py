@@ -4,13 +4,13 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from kemono_downloader.api.kemono import KemonoApi, normalize_creator_path
-from kemono_downloader.config import DEFAULT_CONCURRENCY
-from kemono_downloader.downloader.engine import DownloadEngine
-from kemono_downloader.downloader.models import DateNamingMode, DownloadEvent
-from kemono_downloader.downloader.service import DownloadService
-from kemono_downloader.downloader.state import StateStore, ensure_state_dir, state_dir_for
-from kemono_downloader.settings import failed_export_path
+from pawchive.api.pawchive import PawchiveApi, normalize_creator_path
+from pawchive.config import DEFAULT_CONCURRENCY
+from pawchive.downloader.engine import DownloadEngine
+from pawchive.downloader.models import DateNamingMode, DownloadEvent
+from pawchive.downloader.service import DownloadService
+from pawchive.downloader.state import StateStore, ensure_state_dir, state_dir_for
+from pawchive.settings import failed_export_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,7 +36,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         print("并发数必须大于 0")
         return 1
 
-    api = KemonoApi()
+    api = PawchiveApi()
     service = DownloadService(api)
 
     if args.command == "list":
@@ -70,7 +70,7 @@ async def main_async(argv: list[str] | None = None) -> int:
     print(f"准备流式处理 {len(posts)} 条帖子")
 
     state = StateStore(
-        f"kemono_{normalize_creator_path(args.url)}",
+        f"pawchive_{normalize_creator_path(args.url)}",
         root=state_dir_for(output_dir),
     )
     engine = DownloadEngine(concurrency=args.concurrency)
