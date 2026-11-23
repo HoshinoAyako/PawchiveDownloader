@@ -182,11 +182,10 @@ def test_install_and_rollback() -> None:
         work = Path(temp)
         target = work / "PawchiveDownloader.exe"
         shutil.copy2(fixture, target)
-        info = updater.ensure_install_baseline(target)
-        assert_true(info is not None and info.baseline, "安装基线未建立")
-        assert_true(info.manifest.is_file(), "安装基线文件未写入")
+        info = updater.verify_target(target)
+        assert_true(info.sha256 == old_hash, "当前程序结构校验失败")
 
-        update = work / "PawchiveDownloader-v1.9.0.exe"
+        update = work / "PawchiveDownloader-v1.9.1.exe"
         shutil.copy2(fixture, update)
         with update.open("ab") as handle:
             handle.write(b"\0" * 4096)
@@ -199,9 +198,18 @@ def test_install_and_rollback() -> None:
         assert_true(sha256(target) == new_hash, "替换后的目标文件哈希不一致")
         assert_true(backup.is_file() and sha256(backup) == old_hash, "旧文件备份不完整")
         info = updater.verify_target(target)
-        assert_true(info.sha256 == new_hash and not info.baseline, "更新后基线未刷新")
+        assert_true(info.sha256 == new_hash, "更新后目标文件校验失败")
+        assert_true(
+            not target.with_name(target.name + ".sha256").exists(),
+            "新版不应生成 .sha256 sidecar",
+        )
         removed = updater.cleanup_previous_update_files(target)
         assert_true(removed >= 1 and not backup.exists(), "旧备份未清理")
+
+        legacy = target.with_name(target.name + ".sha256")
+        legacy.write_text("old-baseline", encoding="utf-8")
+        assert_true(updater.cleanup_legacy_manifest(target) == 1, "旧 sidecar 未清理")
+        assert_true(not legacy.exists(), "旧 sidecar 仍存在")
 
         rollback_target = work / "rollback.exe"
         shutil.copy2(fixture, rollback_target)

@@ -2,7 +2,7 @@
 
 Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载、附件筛选、并发控制、保存目录管理、日志导出和预览图/原图处理。
 
-当前版本：`v1.9.0`
+当前版本：`v1.9.1`
 
 版本号规则：自 `1.9.0` 起遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)；不兼容变更升主版本，向下兼容的新功能升次版本，向下兼容的问题修正升修订号。完整规则见 `CHANGELOG.md`。
 
@@ -64,7 +64,7 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 2. 读取 latest Release，比较版本号；只接受 `.exe` 更新包。
 3. 更新包必须带 `SHA256SUMS.txt`、其他校验清单或 Release asset `digest`；缺失时拒绝更新。
 4. 下载时按字节显示进度并校验 SHA-256。
-5. 校验当前程序的 PE 结构、大小和本地 `.sha256` 安装基线；首次更新会建立基线。
+5. 校验当前程序的 PE 结构、大小与目录可写性；不依赖本地哈希基线，执行强制覆盖式更新。
 6. 将运行中的旧程序重命名为 `.old` 备份，再分块写入新程序并显示复制进度；写入后回读目标文件，校验大小、PE 结构与 SHA-256；失败自动回滚。
 7. 启动新程序，旧进程退出；下次启动清理 `.old` 备份和中断的临时下载目录。
 
@@ -74,9 +74,9 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 <64 位 SHA-256>  PawchiveDownloader-vX.Y.Z.exe
 ```
 
-可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.9.0.exe` 生成校验文件。仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
+可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.9.1.exe` 生成校验文件。仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
 
-程序会在 exe 同目录写入 `<exe 名>.sha256` 作为安装基线。若你手动替换了 exe，旧基线会与新文件不一致，更新器会拒绝覆盖；删除该 `.sha256` 文件后，下次启动或检查更新会为新文件重建基线。
+新版更新器不再在 exe 同目录生成 `<exe 名>.sha256` 安装基线；旧版本留下的该文件会在启动时删除。更新包 SHA-256 校验与写入后的目标文件回读校验仍然保留。
 
 ## 持续集成与日志分析
 

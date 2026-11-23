@@ -77,8 +77,6 @@ class TargetInfo:
     path: Path
     size: int
     sha256: str
-    manifest: Path
-    baseline: bool = False
 
 
 def version_tuple(value: str) -> tuple[int, ...]:
@@ -285,26 +283,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _manifest_path(target: Path) -> Path:
-    return target.with_name(target.name + ".sha256")
-
-
-def _read_manifest(path: Path) -> str:
-    try:
-        text = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-    return text.split()[0].lower() if text else ""
-
-
-def _write_manifest(target: Path, sha256: str) -> None:
-    path = _manifest_path(target)
-    try:
-        path.write_text(f"{sha256}  {target.name}\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _has_pe_header(path: Path) -> bool:
     try:
         with path.open("rb") as handle:
@@ -324,19 +302,8 @@ def current_executable() -> Path | None:
     return Path(sys.executable).resolve()
 
 
-def ensure_install_baseline(target: Path | None = None) -> TargetInfo | None:
-    """在已打包运行时建立当前 exe 的哈希基线；源码运行不建立。"""
-    target = target or current_executable()
-    if target is None or not target.is_file():
-        return None
-    info = verify_target(target, allow_missing_manifest=True)
-    if info.baseline:
-        _write_manifest(target, info.sha256)
-    return info
-
-
-def verify_target(target: Path, *, allow_missing_manifest: bool = False) -> TargetInfo:
-    """校验当前目标 exe 的结构与安装基线。"""
+def verify_target(target: Path) -> TargetInfo:
+    """校验当前目标 exe 的结构、大小与目录可写性，不建立本地哈希基线。"""
     if not target.is_file():
         raise UpdateError("校验当前程序", f"目标文件不存在：{target}")
     if target.stat().st_size < 1024 * 1024:
@@ -345,20 +312,10 @@ def verify_target(target: Path, *, allow_missing_manifest: bool = False) -> Targ
         raise UpdateError("校验当前程序", "目标文件不是有效的 Windows PE 可执行文件")
     if not os.access(target.parent, os.W_OK):
         raise UpdateError("校验当前程序", f"目标目录不可写：{target.parent}")
-    sha = _sha256_file(target)
-    manifest = _manifest_path(target)
-    expected = _read_manifest(manifest)
-    if expected and expected != sha:
-        raise UpdateError(
-            "校验当前程序",
-            "当前程序 SHA-256 与安装基线不一致，已停止替换以免覆盖未知文件",
-        )
     return TargetInfo(
         path=target,
         size=target.stat().st_size,
-        sha256=sha,
-        manifest=manifest,
-        baseline=not expected,
+        sha256=_sha256_file(target),
     )
 
 
@@ -423,7 +380,6 @@ def install_update(
         actual_digest = _sha256_file(target)
         if actual_digest.lower() != expected_hash.lower():
             raise UpdateError("校验目标文件", "写入后的目标文件 SHA-256 与更新包不一致")
-        _write_manifest(target, expected_hash)
     except BaseException as exc:
         try:
             target.unlink(missing_ok=True)
@@ -472,6 +428,19 @@ def cleanup_previous_update_files(target: Path | None = None) -> int:
     return removed
 
 
+def cleanup_legacy_manifest(target: Path | None = None) -> int:
+    """删除旧版安装基线 sidecar；新版不再生成该文件。"""
+    target = target or current_executable()
+    if target is None:
+        return 0
+    path = target.with_name(target.name + ".sha256")
+    try:
+        path.unlink()
+        return 1
+    except OSError:
+        return 0
+
+
 def cleanup_update_temp(prefix: str = "pawchive_update_") -> int:
     """清理上次中断的临时下载目录。"""
     root = Path(tempfile.gettempdir())
@@ -499,11 +468,11 @@ __all__ = [
     "TargetInfo",
     "UpdateAsset",
     "UpdateError",
+    "cleanup_legacy_manifest",
     "cleanup_previous_update_files",
     "cleanup_update_temp",
     "current_executable",
     "download_update",
-    "ensure_install_baseline",
     "expected_sha256",
     "install_update",
     "is_newer",

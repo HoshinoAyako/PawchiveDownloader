@@ -74,11 +74,11 @@ from pawchive.release_notes import version_announcement_text
 from pawchive.updater import (
     PROJECT_URL,
     UpdateError,
+    cleanup_legacy_manifest,
     cleanup_previous_update_files,
     cleanup_update_temp,
     current_executable,
     download_update,
-    ensure_install_baseline,
     expected_sha256,
     install_update,
     is_newer,
@@ -489,11 +489,8 @@ class UpdateWorker(QObject):
                 raise UpdateError("版本检查", "最新 Release 没有可下载的 exe 附件")
             expected_hash = expected_sha256(release, asset)
 
-            self._emit_stage("校验当前程序与安装基线...")
-            target_info = verify_target(target)
-            if target_info.baseline:
-                ensure_install_baseline(target)
-                self.log_line.emit("首次更新：已建立当前程序的哈希基线", False)
+            self._emit_stage("校验当前程序...")
+            verify_target(target)
 
             self._emit_stage(f"发现新版本 v{release.version}，准备下载 {asset.name}")
             temp_dir = Path(tempfile.mkdtemp(prefix="pawchive_update_"))
@@ -3447,7 +3444,7 @@ def main() -> int:
     try:
         cleanup_previous_update_files()
         cleanup_update_temp()
-        ensure_install_baseline()
+        cleanup_legacy_manifest()
     except OSError:
         pass
     window = MainWindow(font_family)
