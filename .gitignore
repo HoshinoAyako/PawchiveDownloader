@@ -221,3 +221,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Pawchive Downloader local data and build output
+*.exe
+*.part
+*.tmp
+Failed_Downloads.txt
+Config/
+Temp/
+State/
+Log/
+dist/
+build/
+PawchiveDownload/
+
+# Keep the PyInstaller recipe in version control
+!PawchiveDownloader.spec

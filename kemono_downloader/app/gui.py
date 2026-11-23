@@ -1,0 +1,2971 @@
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import hashlib
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+
+from PyQt6.QtCore import QObject, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QPixmap,
+    QTextCharFormat,
+    QTextCursor,
+)
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizeGrip,
+    QSpinBox,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from kemono_downloader.api.kemono import KemonoApi, normalize_creator_path
+from kemono_downloader.downloader.engine import DownloadEngine
+from kemono_downloader.downloader.models import DateNamingMode, DownloadEvent, PostItem
+from kemono_downloader.downloader.service import DownloadService
+from kemono_downloader.downloader.state import StateStore, ensure_state_dir, state_dir_for
+from kemono_downloader.downloader.temp import (
+    clear_temp_root,
+    iter_part_files,
+    iter_temp_entries,
+    migrate_program_root,
+)
+from kemono_downloader.image_audit import (
+    PreviewAuditResult,
+    PreviewCandidate,
+    audit_preview_images,
+    replace_preview_images,
+)
+from kemono_downloader.release_notes import version_announcement_text
+from kemono_downloader.selfcheck import needs_self_check, run_self_check
+from kemono_downloader.verify import (
+    STATUS_LABELS,
+    SavedPost,
+    SaveScan,
+    VerifyResult,
+    path_key,
+    scan_save_root,
+    verify_save_root,
+)
+from kemono_downloader.settings import (
+    ATTACHMENT_CATEGORIES,
+    ATTACHMENT_CATEGORY_EXTS,
+    ATTACHMENT_CATEGORY_KEYS,
+    ATTACHMENT_CATEGORY_LABELS,
+    AppSettings,
+    IMAGE_SOURCE_KEYS,
+    IMAGE_SOURCE_LABELS,
+    MAX_FILE_CONCURRENCY,
+    MAX_POST_CONCURRENCY,
+    PROXY_TYPE_LABELS,
+    describe_settings,
+    describe_settings_brief,
+    ensure_program_layout,
+    failed_export_path,
+    load_settings,
+    normalize_extra_extensions,
+    normalize_extra_output_dirs,
+    normalize_output_dir,
+    normalize_proxy_address,
+    normalize_storage_dir,
+    program_config_path,
+    program_log_dir,
+    program_root_for,
+    resolve_temp_root,
+    save_settings,
+    storage_paths_overlap,
+)
+from kemono_downloader.theme import (
+    THEME_KEYS,
+    THEME_LABELS,
+    apply_title_bar,
+    resolve_theme,
+)
+from kemono_downloader.app.style import (
+    announcement_qss,
+    main_qss,
+    message_qss,
+    palette_for,
+    settings_qss,
+)
+from kemono_downloader.version import APP_NAME, APP_VERSION
+
+
+ASSET_DIR = Path(__file__).resolve().parents[2] / "assets"
+BACKGROUND_PATH = ASSET_DIR / "background.jpg"
+FONT_PATH = ASSET_DIR / "YeZiGongChangTangYingHei-2.ttf"
+ICON_PATH = ASSET_DIR / "icon.ico"
+CHECK_ICON_PATH = ASSET_DIR / "check.png"
+ARROW_DOWN_PATH = ASSET_DIR / "arrow_down.png"
+ARROW_UP_PATH = ASSET_DIR / "arrow_up.png"
+ARROW_DOWN_LIGHT_PATH = ASSET_DIR / "arrow_down_light.png"
+ARROW_UP_LIGHT_PATH = ASSET_DIR / "arrow_up_light.png"
+BRANCH_CLOSED = {"dark": ASSET_DIR / "branch_closed_dark.png", "light": ASSET_DIR / "branch_closed_light.png"}
+BRANCH_OPEN = {"dark": ASSET_DIR / "branch_open_dark.png", "light": ASSET_DIR / "branch_open_light.png"}
+TITLE_ICON_MIN = {"dark": ASSET_DIR / "win_min_dark.svg", "light": ASSET_DIR / "win_min_light.svg"}
+TITLE_ICON_MAX = {"dark": ASSET_DIR / "win_max_dark.svg", "light": ASSET_DIR / "win_max_light.svg"}
+TITLE_ICON_RESTORE = {
+    "dark": ASSET_DIR / "win_restore_dark.svg",
+    "light": ASSET_DIR / "win_restore_light.svg",
+}
+TITLE_ICON_CLOSE = {"dark": ASSET_DIR / "win_close_dark.svg", "light": ASSET_DIR / "win_close_light.svg"}
+TITLE_ICON_CLOSE_HOVER = {
+    "dark": ASSET_DIR / "win_close_dark_hover.svg",
+    "light": ASSET_DIR / "win_close_light_hover.svg",
+}
+DEFAULT_FONT_FAMILY = "Microsoft YaHei UI"
+WINDOWS_APP_ID = "PawchiveDownloader.App"
+
+
+def format_size(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def section_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setObjectName("sectionLabel")
+    return label
+
+
+def divider() -> QFrame:
+    line = QFrame()
+    line.setObjectName("divider")
+    line.setFrameShape(QFrame.Shape.HLine)
+    line.setFixedHeight(1)
+    return line
+
+
+def style_button(button: QPushButton, height: int = 36, width: int | None = None) -> QPushButton:
+    button.setFixedHeight(height)
+    if width:
+        button.setFixedWidth(width)
+    button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    return button
+
+
+MESSAGE_KINDS = {
+    "info": ("i", "#3478f6"),
+    "warning": ("!", "#e8a33d"),
+    "error": ("!", "#e06060"),
+}
+
+
+class MessageDialog(QDialog):
+    """与主界面同一套深色风格的提示/确认弹窗，替代系统 QMessageBox。"""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        title: str,
+        text: str,
+        kind: str = "info",
+        confirm: bool = False,
+        theme: str = "dark",
+    ):
+        super().__init__(parent)
+        self.confirmed = False
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self.palette = palette_for(self.theme)
+        self.setWindowTitle(title)
+        self.setWindowIcon(load_app_icon())
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setFixedWidth(440)
+        self._drag_offset = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 20)
+        self.card = QFrame()
+        self.card.setObjectName("dialogCard")
+        shadow = QGraphicsDropShadowEffect(self.card)
+        shadow.setBlurRadius(34)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QColor(0, 0, 0, self.palette.shadow_alpha))
+        self.card.setGraphicsEffect(shadow)
+        outer.addWidget(self.card)
+
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(22, 18, 22, 18)
+        card_layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        glyph, color = MESSAGE_KINDS.get(kind, MESSAGE_KINDS["info"])
+        badge = QLabel(glyph)
+        badge.setFixedSize(24, 24)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setStyleSheet(
+            f"background: {color}; color: #ffffff; border-radius: 12px;"
+            "font-size: 13px; font-weight: 700;"
+        )
+        header.addWidget(badge, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        heading = QLabel(title)
+        heading.setObjectName("dialogTitle")
+        header.addWidget(heading)
+        header.addStretch(1)
+
+        close_icon = QPushButton("✕")
+        close_icon.setObjectName("dialogClose")
+        close_icon.setFixedSize(26, 26)
+        close_icon.setToolTip("关闭")
+        close_icon.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_icon.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_icon.clicked.connect(self.reject)
+        header.addWidget(close_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
+        card_layout.addLayout(header)
+
+        card_layout.addWidget(divider())
+
+        body = QLabel(text)
+        body.setObjectName("dialogBody")
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        body.setMinimumWidth(356)
+        card_layout.addWidget(body)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        buttons.addStretch(1)
+        if confirm:
+            cancel_button = QPushButton("取消")
+            cancel_button.setObjectName("dialogGhost")
+            style_button(cancel_button, 34, 84)
+            cancel_button.clicked.connect(self.reject)
+            buttons.addWidget(cancel_button)
+        ok_button = QPushButton("确定")
+        ok_button.setObjectName("dialogPrimary")
+        style_button(ok_button, 34, 96)
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(self._accept)
+        buttons.addWidget(ok_button)
+        card_layout.addLayout(buttons)
+
+        self.setStyleSheet(message_qss(self.palette))
+
+        self.adjustSize()
+
+    def _accept(self) -> None:
+        self.confirmed = True
+        self.accept()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self.parentWidget() is not None:
+            center = self.parentWidget().window().frameGeometry().center()
+            self.move(center - self.rect().center())
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    @classmethod
+    def show_message(
+        cls,
+        parent: QWidget | None,
+        title: str,
+        text: str,
+        kind: str = "info",
+        confirm: bool = False,
+        theme: str = "dark",
+    ) -> bool:
+        dialog = cls(parent, title, text, kind, confirm, theme)
+        dialog.exec()
+        return dialog.confirmed
+
+
+class AnnouncementDialog(QDialog):
+    closed = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        text: str,
+        font_family: str,
+        parent: QWidget | None = None,
+        version: str = "",
+        theme: str = "dark",
+    ):
+        super().__init__(parent)
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self.setWindowTitle("版本更新")
+        self.setWindowIcon(load_app_icon())
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self._drag_offset = None
+        self.resize(600, 460)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title = QLabel("版本更新")
+        title.setObjectName("announcementTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        close_icon = QPushButton("✕")
+        close_icon.setObjectName("ghostIconButton")
+        close_icon.setFixedSize(30, 30)
+        close_icon.setToolTip("关闭公告")
+        close_icon.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_icon.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_icon.clicked.connect(self.close)
+        header.addWidget(close_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
+        layout.addWidget(divider())
+
+        content = QPlainTextEdit()
+        content.setObjectName("announcementContent")
+        content.setReadOnly(True)
+        content.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        content.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content.setPlainText(text)
+        layout.addWidget(content, stretch=1)
+
+        self.dismiss_box = QCheckBox("下次版本更新前不再提示")
+        self.dismiss_box.setToolTip(
+            f"当前版本 v{version or '未知'}；程序版本更新后会重新显示公告"
+        )
+        self.dismiss_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(self.dismiss_box)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(12)
+        note = QLabel(f"当前版本 v{version or '未知'} 的更新内容")
+        note.setObjectName("dialogHint")
+        footer.addWidget(note)
+        footer.addStretch(1)
+        close_button = QPushButton("关闭")
+        close_button.setObjectName("ghostButton")
+        style_button(close_button, 34, 96)
+        close_button.clicked.connect(self.close)
+        footer.addWidget(close_button)
+        layout.addLayout(footer)
+
+        self.setStyleSheet(
+            announcement_qss(palette_for(self.theme), font_family, CHECK_ICON_PATH.as_posix())
+        )
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        apply_title_bar(self, self.theme)
+        if self.parentWidget() is not None:
+            center = self.parentWidget().window().frameGeometry().center()
+            self.move(center - self.rect().center())
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.closed.emit(self.dismiss_box.isChecked())
+        super().closeEvent(event)
+
+
+class SettingsDialog(QDialog):
+    """下载并发、附件类型、代理设置。"""
+
+    def __init__(
+        self,
+        settings: AppSettings,
+        font_family: str,
+        parent: QWidget | None = None,
+        theme: str = "dark",
+        output_dir: Path | None = None,
+    ):
+        super().__init__(parent)
+        self.result_settings = settings.normalized()
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self.font_family = font_family
+        self.output_dir = program_root_for(output_dir)
+        self.result_output_dir = str(self.output_dir) if self.output_dir else ""
+        self._pending_program_root = self.output_dir
+        self._extra_output_dirs = list(self.result_settings.extra_output_dirs)
+        self._sync_guard = False
+        self.setWindowTitle("设置")
+        self.setWindowIcon(load_app_icon())
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self._drag_offset = None
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry().height() if screen else 900
+        self.resize(760, min(760, max(560, available - 80)))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        outer.addWidget(scroll, 1)
+
+        body = QWidget()
+        body.setObjectName("settingsBody")
+        body.setAutoFillBackground(False)
+        scroll.setWidget(body)
+
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(24, 20, 24, 10)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QLabel("下载设置")
+        title.setObjectName("settingsTitle")
+        subtitle = QLabel("界面、图片、并发、程序文件、附件与代理")
+        subtitle.setObjectName("settingsSubtitle")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        header.addLayout(title_col, 1)
+        close_button = QPushButton("✕")
+        close_button.setObjectName("settingsClose")
+        close_button.setFixedSize(28, 28)
+        close_button.setToolTip("关闭设置")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_button.clicked.connect(self.reject)
+        header.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(header)
+        layout.addWidget(divider())
+
+        appearance_form = QFormLayout()
+        appearance_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        appearance_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        appearance_form.setHorizontalSpacing(16)
+        appearance_form.setVerticalSpacing(10)
+        self.theme_combo = QComboBox()
+        for key in THEME_KEYS:
+            self.theme_combo.addItem(THEME_LABELS[key], key)
+        index = self.theme_combo.findData(self.result_settings.ui_theme)
+        self.theme_combo.setCurrentIndex(index if index >= 0 else self.theme_combo.findData("dark"))
+        self.theme_combo.setToolTip(
+            "“跟随系统”读取 Windows 的浅色/深色应用模式；保存后立即生效，标题栏一起变。"
+        )
+        self.theme_combo.currentIndexChanged.connect(self._preview_theme)
+        appearance_form.addRow("界面主题：", self.theme_combo)
+        layout.addWidget(section_label("外观"))
+        layout.addLayout(appearance_form)
+
+        perf_form = QFormLayout()
+        perf_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        perf_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        perf_form.setHorizontalSpacing(16)
+        perf_form.setVerticalSpacing(10)
+
+        self.file_spin = QSpinBox()
+        self.file_spin.setRange(1, MAX_FILE_CONCURRENCY)
+        self.file_spin.setValue(self.result_settings.file_concurrency)
+        self.file_spin.setFixedWidth(132)
+        self.file_spin.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.file_spin.setToolTip(f"同时下载的文件数，1～{MAX_FILE_CONCURRENCY} 个")
+
+        self.post_spin = QSpinBox()
+        self.post_spin.setRange(1, MAX_POST_CONCURRENCY)
+        self.post_spin.setValue(self.result_settings.post_concurrency)
+        self.post_spin.setFixedWidth(132)
+        self.post_spin.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.post_spin.setToolTip(f"同时解析并下载的帖子数，1～{MAX_POST_CONCURRENCY} 个")
+
+        self.image_source_combo = QComboBox()
+        for key in IMAGE_SOURCE_KEYS:
+            self.image_source_combo.addItem(IMAGE_SOURCE_LABELS[key], key)
+        index = self.image_source_combo.findData(self.result_settings.image_source)
+        self.image_source_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.image_source_combo.setFixedWidth(132)
+        self.image_source_combo.setToolTip(
+            "预览图走缩略图域名，文件更小、下载更快；原图走文件域名，清晰度更高但体积更大。"
+        )
+
+        self.proxy_type = QComboBox()
+        for key in ("none", "http", "https", "socks5"):
+            self.proxy_type.addItem(PROXY_TYPE_LABELS[key], key)
+        index = self.proxy_type.findData(self.result_settings.proxy_type)
+        self.proxy_type.setCurrentIndex(index if index >= 0 else 0)
+        self.proxy_type.currentIndexChanged.connect(self._sync_proxy_state)
+
+        self.proxy_edit = QLineEdit(self.result_settings.proxy_address)
+        self.proxy_edit.setPlaceholderText("127.0.0.1:7890，或 user:pass@127.0.0.1:1080")
+
+        self.attachment_boxes: dict[str, QCheckBox] = {}
+        attachment_widget = QWidget()
+        attachment_layout = QVBoxLayout(attachment_widget)
+        attachment_layout.setContentsMargins(0, 0, 0, 0)
+        attachment_layout.setSpacing(6)
+        attachment_grid = QGridLayout()
+        attachment_grid.setContentsMargins(0, 0, 0, 0)
+        attachment_grid.setHorizontalSpacing(14)
+        attachment_grid.setVerticalSpacing(4)
+        for index, (key, label, exts) in enumerate(ATTACHMENT_CATEGORIES):
+            box = QCheckBox(label)
+            box.setMinimumHeight(22)
+            box.setChecked(key in self.result_settings.attachment_types)
+            if exts:
+                box.setToolTip("包含扩展名：" + "  ".join(exts))
+            else:
+                box.setToolTip("勾选后允许下载所有未识别扩展名的附件")
+            self.attachment_boxes[key] = box
+            attachment_grid.addWidget(box, index // 2, index % 2)
+            if key == "other":
+                box.toggled.connect(self._sync_attachment_state)
+        attachment_layout.addLayout(attachment_grid)
+
+        image_note = QLabel("图片（jpg/png/gif/webp 等）始终下载，无需勾选。")
+        image_note.setObjectName("settingsHint")
+        image_note.setWordWrap(True)
+        attachment_layout.addWidget(image_note)
+
+        extra_text = ", ".join("." + ext for ext in self.result_settings.extra_extensions)
+        self.extra_edit = QLineEdit(extra_text)
+        self.extra_edit.setPlaceholderText("例如 psd, blend, bin（逗号分隔）")
+        self.extra_edit.setToolTip(
+            "默认不可填写：勾选“其他未知扩展名”可长期允许全部后缀，"
+            "或勾选右侧“临时启用（仅本次任务）”后临时填写。"
+        )
+
+        self.temp_extra_box = QCheckBox("临时启用（仅本次任务）")
+        self.temp_extra_box.setMinimumHeight(22)
+        self.temp_extra_box.setChecked(self.result_settings.temp_custom_extensions)
+        self.temp_extra_box.setToolTip(
+            "未勾选“其他未知扩展名”时，用它可以只为下一次下载放行自定义后缀；任务结束自动取消。"
+        )
+        self.temp_extra_box.toggled.connect(self._sync_attachment_state)
+
+        extra_widget = QWidget()
+        extra_layout = QVBoxLayout(extra_widget)
+        extra_layout.setContentsMargins(0, 0, 0, 0)
+        extra_layout.setSpacing(6)
+        extra_row = QHBoxLayout()
+        extra_row.setContentsMargins(0, 0, 0, 0)
+        extra_row.setSpacing(10)
+        extra_tag = QLabel("自定义扩展名：")
+        extra_tag.setObjectName("fieldLabel")
+        extra_tag.setFixedWidth(96)
+        extra_row.addWidget(extra_tag)
+        extra_row.addWidget(self.extra_edit, stretch=1)
+        extra_row.addWidget(self.temp_extra_box)
+        extra_layout.addLayout(extra_row)
+        extra_note = QLabel(
+            "自定义扩展名默认关闭，无法填写。勾选“其他未知扩展名”可长期允许全部后缀；"
+            "只想临时放行个别后缀时，勾选右侧“临时启用（仅本次任务）”，下载结束后会自动取消。"
+        )
+        extra_note.setObjectName("settingsHint")
+        extra_note.setWordWrap(True)
+        extra_layout.addWidget(extra_note)
+
+        perf_form.addRow("下载并发数：", self.file_spin)
+        perf_form.addRow("帖子并发数：", self.post_spin)
+        perf_form.addRow("图片下载：", self.image_source_combo)
+        layout.addWidget(section_label("性能"))
+        layout.addLayout(perf_form)
+
+        program_form = QFormLayout()
+        program_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        program_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        program_form.setHorizontalSpacing(16)
+        program_form.setVerticalSpacing(10)
+
+        self.program_path_edit = QLineEdit()
+        self.program_path_edit.setReadOnly(True)
+        self.program_path_edit.setEnabled(False)
+        self.program_path_edit.setPlaceholderText("先在主界面选择保存目录，程序会自动在下面创建 PawchiveDownload")
+        self.program_path_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self.temp_path_edit = QLineEdit()
+        self.temp_path_edit.setReadOnly(True)
+        self.temp_path_edit.setPlaceholderText("PawchiveDownload/Temp")
+        self.temp_path_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self.config_path_edit = QLineEdit()
+        self.config_path_edit.setReadOnly(True)
+        self.config_path_edit.setPlaceholderText("PawchiveDownload/Config/Settings.json")
+        self.config_path_edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self.temp_migrate_button = QPushButton("迁移")
+        self.temp_migrate_button.setObjectName("ghostButton")
+        style_button(self.temp_migrate_button, 34, 84)
+        self.temp_migrate_button.setToolTip(
+            "选择新的位置，保存设置时把整个 PawchiveDownload（帖子、Config、Temp）一起迁移"
+        )
+        self.temp_migrate_button.setEnabled(self._pending_program_root is not None)
+        self.temp_migrate_button.clicked.connect(self._choose_program_location)
+
+        program_row = QHBoxLayout()
+        program_row.setContentsMargins(0, 0, 0, 0)
+        program_row.setSpacing(10)
+        program_row.addWidget(self.program_path_edit, stretch=1)
+        program_row.addWidget(self.temp_migrate_button)
+        program_widget = QWidget()
+        program_widget.setLayout(program_row)
+        program_form.addRow("程序目录：", program_widget)
+        program_form.addRow("临时文件：", self.temp_path_edit)
+        program_form.addRow("配置文件：", self.config_path_edit)
+
+        program_note = QLabel(
+            "程序文件全部收进 PawchiveDownload：Temp 存 .part 与 State 下载记录，"
+            "Config 存 Settings.json、Log 与 Failed_Downloads.txt；保存根只记录在注册表，不再写 AppData。"
+            "创作者 URL 不保存。迁移会整体移动该目录。"
+        )
+        program_note.setObjectName("settingsHint")
+        program_note.setWordWrap(True)
+        layout.addWidget(section_label("程序文件设置"))
+        layout.addLayout(program_form)
+        layout.addWidget(program_note)
+
+        storage_note = QLabel(
+            "主保存目录含 Config/Temp/State/Log，只能整体迁移，不能手动改路径。"
+            "额外保存目录只保存帖子内容，按添加顺序编号；可在主界面下拉菜单中切换。"
+        )
+        storage_note.setObjectName("settingsHint")
+        storage_note.setWordWrap(True)
+        self.extra_output_list = QListWidget()
+        self.extra_output_list.setObjectName("extraStorageList")
+        self.extra_output_list.setFixedHeight(92)
+        self.extra_output_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.extra_output_list.setToolTip("额外保存目录不包含程序元数据，不能与主目录相同或互为父子目录")
+        self.extra_add_button = QPushButton("添加目录")
+        self.extra_add_button.setObjectName("ghostButton")
+        style_button(self.extra_add_button, 32, 92)
+        self.extra_add_button.clicked.connect(self._add_extra_output_dir)
+        self.extra_remove_button = QPushButton("移除选中")
+        self.extra_remove_button.setObjectName("ghostButton")
+        style_button(self.extra_remove_button, 32, 92)
+        self.extra_remove_button.clicked.connect(self._remove_extra_output_dir)
+        extra_buttons = QHBoxLayout()
+        extra_buttons.setContentsMargins(0, 0, 0, 0)
+        extra_buttons.setSpacing(8)
+        extra_buttons.addWidget(self.extra_add_button)
+        extra_buttons.addWidget(self.extra_remove_button)
+        extra_buttons.addStretch(1)
+        storage_box = QVBoxLayout()
+        storage_box.setContentsMargins(0, 0, 0, 0)
+        storage_box.setSpacing(8)
+        storage_box.addWidget(self.extra_output_list)
+        storage_box.addLayout(extra_buttons)
+        layout.addWidget(section_label("存储管理"))
+        layout.addWidget(storage_note)
+        layout.addLayout(storage_box)
+        self._refresh_extra_output_list()
+        self._refresh_program_paths()
+
+        inner_card = QWidget()
+        inner_card.setObjectName("innerCard")
+        inner_box = QVBoxLayout(inner_card)
+        inner_box.setContentsMargins(14, 12, 14, 12)
+        inner_box.setSpacing(10)
+        inner_box.addWidget(attachment_widget)
+        inner_box.addWidget(extra_widget)
+        layout.addWidget(section_label("附件"))
+        layout.addWidget(inner_card)
+
+        net_form = QFormLayout()
+        net_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        net_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        net_form.setHorizontalSpacing(16)
+        net_form.setVerticalSpacing(10)
+        net_form.addRow("代理类型：", self.proxy_type)
+        net_form.addRow("代理地址：", self.proxy_edit)
+        layout.addWidget(section_label("网络"))
+        layout.addLayout(net_form)
+
+        hint = QLabel(
+            "站点限制：同时下载不超过 5 个、请求频率约 1 次/秒；并发越高越容易被临时拒绝。\n"
+            "未勾选任何类型、也没有临时扩展名时，只下载图片。代理填 host:port，可带账号：user:pass@host:port。"
+        )
+        hint.setObjectName("settingsHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(24, 10, 24, 14)
+        buttons.setSpacing(10)
+        buttons.addStretch(1)
+        cancel_button = QPushButton("取消")
+        cancel_button.setObjectName("ghostButton")
+        style_button(cancel_button, 36, 96)
+        save_button = QPushButton("保存")
+        save_button.setObjectName("primaryButton")
+        style_button(save_button, 36, 108)
+        cancel_button.clicked.connect(self.reject)
+        save_button.clicked.connect(self._on_save)
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(save_button)
+        footer = QWidget()
+        footer.setObjectName("settingsFooter")
+        footer.setLayout(buttons)
+        outer.addWidget(footer)
+
+        self._sync_proxy_state()
+        self._sync_attachment_state()
+        self._apply_style(self.font_family, self.theme)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def _sync_attachment_state(self) -> None:
+        if self._sync_guard:
+            return
+        self._sync_guard = True
+        try:
+            other = self.attachment_boxes["other"].isChecked()
+            if other and self.temp_extra_box.isChecked():
+                self.temp_extra_box.setChecked(False)
+            self.temp_extra_box.setEnabled(not other)
+            enabled = other or self.temp_extra_box.isChecked()
+            self.extra_edit.setEnabled(enabled)
+            if enabled:
+                self.extra_edit.setPlaceholderText("例如 psd, blend, bin（逗号分隔）")
+            else:
+                self.extra_edit.setPlaceholderText("默认关闭，勾选右侧开关后可填")
+        finally:
+            self._sync_guard = False
+
+    def _sync_proxy_state(self) -> None:
+        proxy_type = self.proxy_type.currentData() or "none"
+        enabled = proxy_type != "none"
+        self.proxy_edit.setEnabled(enabled)
+        if not enabled:
+            self.proxy_edit.setPlaceholderText("不使用代理")
+        elif proxy_type == "socks5":
+            self.proxy_edit.setPlaceholderText("127.0.0.1:1080，或 user:pass@127.0.0.1:1080")
+        else:
+            self.proxy_edit.setPlaceholderText("127.0.0.1:7890，或 user:pass@127.0.0.1:7890")
+
+    def _refresh_extra_output_list(self) -> None:
+        if not hasattr(self, "extra_output_list"):
+            return
+        self.extra_output_list.clear()
+        root = self._pending_program_root
+        if root is not None:
+            primary_item = QListWidgetItem(f"主目录（含程序文件，只可迁移）  {root}")
+            primary_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            primary_item.setToolTip("主目录包含 Config/Temp/State/Log，不能在这里修改")
+            self.extra_output_list.addItem(primary_item)
+        for index, path in enumerate(self._extra_output_dirs, start=1):
+            item = QListWidgetItem(f"{index}. {path}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            self.extra_output_list.addItem(item)
+        if not self._extra_output_dirs:
+            if root is None:
+                self.extra_output_list.addItem("先选择主保存目录，才能添加额外目录")
+            else:
+                self.extra_output_list.addItem("尚未添加额外保存目录")
+        has_root = root is not None
+        self.extra_add_button.setEnabled(has_root)
+        self.extra_remove_button.setEnabled(has_root and bool(self._extra_output_dirs))
+
+    def _add_extra_output_dir(self) -> None:
+        root = self._pending_program_root
+        if root is None:
+            MessageDialog.show_message(
+                self, "还没有主保存目录",
+                "请先在主界面选择主保存目录，再添加额外保存目录。",
+                kind="info", theme=self.theme,
+            )
+            return
+        path = QFileDialog.getExistingDirectory(
+            self, "选择额外保存目录（不包含程序文件）",
+            str(root.parent),
+        )
+        if not path:
+            return
+        target = normalize_storage_dir(path)
+        if not target:
+            MessageDialog.show_message(
+                self, "目录无效", "请选择本机上的绝对路径。",
+                kind="warning", theme=self.theme,
+            )
+            return
+        if storage_paths_overlap(target, root):
+            MessageDialog.show_message(
+                self, "目录不能与主目录重叠",
+                "额外保存目录不能与主保存目录相同，也不能是它的上级或子目录。\n"
+                "请换一个独立目录。",
+                kind="warning", theme=self.theme,
+            )
+            return
+        merged = normalize_extra_output_dirs(
+            (*self._extra_output_dirs, target),
+            root,
+        )
+        if len(merged) == len(self._extra_output_dirs):
+            MessageDialog.show_message(
+                self, "目录已存在", "这个目录已经在列表里了。",
+                kind="info", theme=self.theme,
+            )
+            return
+        self._extra_output_dirs = list(merged)
+        self._refresh_extra_output_list()
+
+    def _remove_extra_output_dir(self) -> None:
+        item = self.extra_output_list.currentItem()
+        path = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if not path:
+            return
+        self._extra_output_dirs = [
+            value for value in self._extra_output_dirs if value != str(path)
+        ]
+        self._refresh_extra_output_list()
+
+    def _refresh_program_paths(self) -> None:
+        root = self._pending_program_root
+        if root is None:
+            for field in (self.program_path_edit, self.temp_path_edit, self.config_path_edit):
+                field.clear()
+            self.program_path_edit.setToolTip("先在主界面选择保存目录")
+            self.temp_path_edit.setToolTip("临时文件固定在 PawchiveDownload/Temp")
+            self.config_path_edit.setToolTip("设置固定在 PawchiveDownload/Config/Settings.json")
+            self.temp_migrate_button.setEnabled(False)
+            self._refresh_extra_output_list()
+            return
+
+        temp_path = root / "Temp"
+        config_path = program_config_path(root)
+        self.program_path_edit.setText(str(root))
+        self.program_path_edit.setCursorPosition(len(str(root)))
+        self.program_path_edit.setToolTip(str(root))
+        self.temp_path_edit.setText(str(temp_path))
+        self.temp_path_edit.setCursorPosition(len(str(temp_path)))
+        self.temp_path_edit.setToolTip(str(temp_path))
+        self.config_path_edit.setText(str(config_path))
+        self.config_path_edit.setCursorPosition(len(str(config_path)))
+        self.config_path_edit.setToolTip(str(config_path))
+        self.temp_migrate_button.setEnabled(True)
+        self._refresh_extra_output_list()
+
+    def _choose_program_location(self) -> None:
+        if self._pending_program_root is None:
+            MessageDialog.show_message(
+                self, "还没有保存目录", "请先在主界面选择保存目录。",
+                kind="info", theme=self.theme
+            )
+            return
+        initial = str(self._pending_program_root.parent)
+        path = QFileDialog.getExistingDirectory(
+            self, "选择新的位置（将整体迁移 PawchiveDownload）", initial
+        )
+        if not path:
+            return
+        target = program_root_for(Path(path))
+        if target is None:
+            MessageDialog.show_message(
+                self, "位置无效", "请选择本机上的绝对路径。",
+                kind="warning", theme=self.theme
+            )
+            return
+        if target == self._pending_program_root:
+            return
+        if target.exists() and not target.is_dir():
+            MessageDialog.show_message(
+                self,
+                "目标位置已有同名文件",
+                f"目标位置已存在同名文件：\n{target}\n\n请换一个位置，或先处理该文件。",
+                kind="warning",
+                theme=self.theme,
+            )
+            return
+        if target.is_dir():
+            try:
+                has_content = any(target.iterdir())
+            except OSError:
+                has_content = True
+            if has_content:
+                MessageDialog.show_message(
+                    self,
+                    "目标目录已有内容",
+                    f"目标位置已有非空的 PawchiveDownload：\n{target}\n\n"
+                    "为避免覆盖已有下载与配置，请换一个位置，或先手动清空目标目录。",
+                    kind="warning",
+                    theme=self.theme,
+                )
+                return
+        self._pending_program_root = target
+        self._extra_output_dirs = list(
+            normalize_extra_output_dirs(self._extra_output_dirs, target)
+        )
+        self._refresh_program_paths()
+
+    def _on_save(self) -> None:
+        proxy_type = str(self.proxy_type.currentData() or "none")
+        proxy_address = self.proxy_edit.text().strip()
+        if proxy_type != "none":
+            try:
+                proxy_address = normalize_proxy_address(proxy_address)
+            except ValueError as exc:
+                MessageDialog.show_message(self, "代理地址无效", str(exc), kind="warning", theme=self.theme)
+                return
+
+        attachment_types = tuple(
+            key for key in ATTACHMENT_CATEGORY_KEYS if self.attachment_boxes[key].isChecked()
+        )
+        other_checked = "other" in attachment_types
+        temp_enabled = self.temp_extra_box.isChecked() and not other_checked
+        if other_checked or temp_enabled:
+            extra_extensions = normalize_extra_extensions(self.extra_edit.text())
+        else:
+            extra_extensions = ()
+
+        old_root = self.output_dir
+        new_root = self._pending_program_root
+        if old_root and new_root and old_root != new_root:
+            QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+            try:
+                moved, errors = migrate_program_root(old_root, new_root)
+            except ValueError as exc:
+                QApplication.restoreOverrideCursor()
+                MessageDialog.show_message(
+                    self, "程序目录不能迁移", str(exc), kind="warning", theme=self.theme
+                )
+                return
+            except Exception as exc:
+                QApplication.restoreOverrideCursor()
+                MessageDialog.show_message(
+                    self, "程序目录迁移失败", str(exc), kind="error", theme=self.theme
+                )
+                return
+            QApplication.restoreOverrideCursor()
+            if errors:
+                MessageDialog.show_message(
+                    self,
+                    "程序目录未完整迁移",
+                    f"已处理 {moved} 个文件；以下步骤失败：\n" + "\n".join(errors[:8]),
+                    kind="error",
+                    theme=self.theme,
+                )
+                return
+
+        if new_root is not None:
+            try:
+                ensure_program_layout(new_root)
+                ensure_state_dir(new_root)
+            except OSError as exc:
+                MessageDialog.show_message(
+                    self, "程序目录不可用", f"无法创建 Config/Temp：\n{new_root}\n\n{exc}",
+                    kind="error", theme=self.theme
+                )
+                return
+        self.result_output_dir = str(new_root) if new_root else ""
+        extra_outputs = normalize_extra_output_dirs(self._extra_output_dirs, self.result_output_dir)
+        old_selected = self.result_settings.selected_output_dir
+        available = ([self.result_output_dir] if self.result_output_dir else []) + list(extra_outputs)
+        if old_selected == str(old_root or ""):
+            selected_output = self.result_output_dir
+        elif old_selected in available:
+            selected_output = old_selected
+        else:
+            selected_output = self.result_output_dir
+
+        self.result_settings = AppSettings(
+            file_concurrency=self.file_spin.value(),
+            post_concurrency=self.post_spin.value(),
+            image_source=str(self.image_source_combo.currentData() or "preview"),
+            proxy_type=proxy_type,
+            proxy_address=proxy_address,
+            attachment_types=attachment_types,
+            extra_extensions=extra_extensions,
+            temp_custom_extensions=temp_enabled,
+            announcement_dismissed_version=self.result_settings.announcement_dismissed_version,
+            last_self_check_version=self.result_settings.last_self_check_version,
+            output_dir=self.result_output_dir,
+            extra_output_dirs=extra_outputs,
+            selected_output_dir=selected_output,
+            temp_dir="",
+            ui_theme=str(self.theme_combo.currentData() or "dark"),
+        ).normalized()
+        self.accept()
+
+    def _preview_theme(self, *_args) -> None:
+        choice = str(self.theme_combo.currentData() or "dark")
+        effective = choice if choice in ("light", "dark") else resolve_theme(choice)
+        if effective == self.theme:
+            return
+        self.theme = effective
+        self._apply_style(self.font_family, self.theme)
+
+    def _apply_style(self, font_family: str, theme: str = "dark") -> None:
+        palette = palette_for(theme)
+        if theme == "light":
+            arrow_down = ARROW_DOWN_LIGHT_PATH.as_posix()
+            arrow_up = ARROW_UP_LIGHT_PATH.as_posix()
+        else:
+            arrow_down = ARROW_DOWN_PATH.as_posix()
+            arrow_up = ARROW_UP_PATH.as_posix()
+        self.setStyleSheet(
+            settings_qss(
+                palette,
+                font_family,
+                CHECK_ICON_PATH.as_posix(),
+                arrow_down,
+                arrow_up,
+            )
+        )
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        apply_title_bar(self, self.theme)
+
+
+class PostLoader(QObject):
+    posts_loaded = pyqtSignal(list)
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, url: str, settings: AppSettings | None = None):
+        super().__init__()
+        self.url = url
+        self.settings = (settings or AppSettings()).normalized()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            posts = asyncio.run(self._main())
+            self.posts_loaded.emit(posts)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+    async def _main(self) -> list[PostItem]:
+        self.log.emit("正在读取帖子列表...")
+        service = DownloadService(KemonoApi(settings=self.settings, image_source=self.settings.image_source))
+        posts = await service.list_posts(self.url)
+        self.log.emit(f"读取完成，共 {len(posts)} 条帖子")
+        return posts
+
+
+class PreviewAuditWorker(QObject):
+    """在后台探测保存目录里能否用原图替换预览图。"""
+
+    done = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        root: Path,
+        state_dir: Path | None,
+        settings: AppSettings,
+    ):
+        super().__init__()
+        self.root = root
+        self.state_dir = state_dir
+        self.settings = settings
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            result = asyncio.run(
+                audit_preview_images(self.root, self.state_dir, self.settings)
+            )
+            self.done.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class PreviewReplaceWorker(QObject):
+    """下载原图并原位替换预览图。"""
+
+    progress = pyqtSignal(int, int)
+    done = pyqtSignal(int, list)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        candidates: list[PreviewCandidate],
+        temp_root: Path,
+        settings: AppSettings,
+    ):
+        super().__init__()
+        self.candidates = candidates
+        self.temp_root = temp_root
+        self.settings = settings
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            count, errors = asyncio.run(
+                replace_preview_images(
+                    self.candidates,
+                    self.temp_root,
+                    self.settings,
+                    progress=lambda done, total: self.progress.emit(done, total),
+                )
+            )
+            self.done.emit(count, errors)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class DownloadWorker(QObject):
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int, int)
+    failed_file = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        creator_url: str,
+        posts: list[PostItem],
+        output_dir: Path,
+        settings: AppSettings,
+        program_root: Path | None = None,
+    ):
+        super().__init__()
+        self.creator_url = creator_url
+        self.posts = posts
+        self.output_dir = output_dir
+        self.program_root = program_root or output_dir
+        self.settings = settings.normalized()
+        self.concurrency = self.settings.file_concurrency
+        self.post_concurrency = self.settings.post_concurrency
+        self.naming_mode = DateNamingMode.PREFIX
+        self.failed_export_path = failed_export_path(self.program_root)
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.pause_event.set()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def pause(self) -> None:
+        self.pause_event.clear()
+
+    def resume(self) -> None:
+        self.pause_event.set()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.pause_event.set()
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+    async def _main(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.program_root.mkdir(parents=True, exist_ok=True)
+        self.failed_export_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.failed_export_path.exists():
+            self.failed_export_path.unlink()
+
+        service = DownloadService(
+            KemonoApi(settings=self.settings, image_source=self.settings.image_source),
+            temp_root=resolve_temp_root(self.settings, self.program_root),
+        )
+        state_root = ensure_state_dir(self.program_root)
+        state_key = f"kemono_{normalize_creator_path(self.creator_url)}"
+        if path_key(self.output_dir) != path_key(self.program_root):
+            digest = hashlib.sha1(
+                path_key(self.output_dir).encode("utf-8", "ignore")
+            ).hexdigest()[:10]
+            state_key = f"{state_key}_{digest}"
+        state = StateStore(
+            state_key,
+            root=state_root,
+        )
+        engine = DownloadEngine(
+            concurrency=self.concurrency,
+            pause_event=self.pause_event,
+            stop_event=self.stop_event,
+            settings=self.settings,
+        )
+        total_posts = len(self.posts)
+        post_index = {post.id: index + 1 for index, post in enumerate(self.posts)}
+        self.log.emit(f"当前设置: {describe_settings(self.settings)}")
+        if self.settings.temp_custom_extensions and "other" not in self.settings.attachment_types:
+            exts = ", ".join("." + ext for ext in self.settings.effective_extra_extensions)
+            self.log.emit(f"注意：本次临时启用了自定义扩展名 {exts}，任务结束后自动取消")
+
+        async def task_batches():
+            async for batch in service.iter_post_task_batches(
+                self.posts,
+                self.output_dir,
+                self.naming_mode,
+                post_concurrency=self.post_concurrency,
+            ):
+                if batch:
+                    post = batch[0].post
+                    index = post_index.get(post.id, 0)
+                    self.log.emit(f"已整理 {index}/{total_posts}: {post.title}")
+                yield batch
+
+        def on_event(event: DownloadEvent) -> None:
+            if event.type == "started":
+                self.progress.emit(0, event.total or 0, 0)
+                self.log.emit(f"开始流式处理 {len(self.posts)} 条帖子")
+            elif event.type == "tasks_added":
+                self.log.emit(event.message)
+            elif event.type == "progress":
+                self.progress.emit(event.done or 0, event.total or 0, event.failed or 0)
+            elif event.type == "file_finished":
+                self.log.emit(f"完成: {event.file_name}")
+            elif event.type == "file_skipped":
+                self.log.emit(f"跳过: {event.file_name}")
+            elif event.type == "file_failed":
+                text = self._format_failed_event(event)
+                self._append_failed_export(text)
+                self.failed_file.emit(f"{event.file_name} | {event.path}")
+                self.log.emit(f"失败: {event.file_name} - {event.message}")
+            elif event.type == "post_finished":
+                if event.failed:
+                    self.log.emit(f"帖子处理完成，有失败文件: {event.post_id}")
+            elif event.type in {"finished", "cancelled"}:
+                self.finished.emit(event.message)
+
+        await engine.run_stream(task_batches(), state, on_event)
+
+    def _format_failed_event(self, event: DownloadEvent) -> str:
+        data = event.data or {}
+        target_path = data.get("target_path") or str(event.path or "")
+        target_dir = data.get("target_dir") or str(Path(target_path).parent if target_path else "")
+        return "\n".join(
+            [
+                f"Post: {event.post_id or ''}",
+                f"File: {event.file_name or ''}",
+                f"URL: {data.get('url') or ''}",
+                f"Target: {target_path}",
+                f"Folder: {target_dir}",
+                f"Error: {event.message}",
+                "",
+            ]
+        )
+
+    def _append_failed_export(self, text: str) -> None:
+        first_write = not self.failed_export_path.exists()
+        with self.failed_export_path.open("a", encoding="utf-8") as file:
+            if first_write:
+                file.write("# Pawchive Downloader failed files\n\n")
+            file.write(text)
+
+
+class TitleBarButton(QPushButton):
+    """标题栏窗口按钮：统一线性图标，不再用字符 — / □ / ✕。"""
+
+    def __init__(self, kind: str, theme: str, tooltip: str, close: bool = False):
+        super().__init__()
+        self.kind = kind
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self._hover = False
+        self.setObjectName("titleBarClose" if close else "titleBarButton")
+        self.setFixedSize(46, 32)
+        self.setIconSize(QSize(16, 16))
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(tooltip)
+        self.setFlat(True)
+        self._sync_icon()
+
+    def _icon(self) -> QIcon:
+        if self.kind == "close":
+            table = TITLE_ICON_CLOSE_HOVER if self._hover else TITLE_ICON_CLOSE
+        elif self.kind == "restore":
+            table = TITLE_ICON_RESTORE
+        elif self.kind == "max":
+            table = TITLE_ICON_MAX
+        else:
+            table = TITLE_ICON_MIN
+        return QIcon(table[self.theme].as_posix())
+
+    def _sync_icon(self) -> None:
+        self.setIcon(self._icon())
+
+    def set_kind(self, kind: str) -> None:
+        self.kind = kind
+        self._sync_icon()
+
+    def set_theme(self, theme: str) -> None:
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self._sync_icon()
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover = True
+        self._sync_icon()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self._hover = False
+        self._sync_icon()
+        super().leaveEvent(event)
+
+
+class TitleBar(QWidget):
+    """自绘标题栏：Win10 无法可靠修改原生标题栏配色，改为自绘以跟随主题。"""
+
+    def __init__(self, window: QMainWindow, title: str, theme: str = "dark"):
+        super().__init__(window)
+        self._window = window
+        self._theme = theme if theme in ("light", "dark") else "dark"
+        self._drag_offset = None
+        self.setObjectName("titleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(40)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 0, 6, 0)
+        layout.setSpacing(8)
+
+        icon_label = QLabel()
+        icon_label.setFixedSize(18, 18)
+        icon_label.setPixmap(load_app_icon().pixmap(QSize(18, 18)))
+        layout.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("titleBarTitle")
+        layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addStretch(1)
+
+        self.min_button = TitleBarButton("min", self._theme, "最小化")
+        self.min_button.clicked.connect(window.showMinimized)
+        self.max_button = TitleBarButton("max", self._theme, "最大化 / 还原")
+        self.max_button.clicked.connect(self._toggle_maximize)
+        self.close_button = TitleBarButton("close", self._theme, "关闭", close=True)
+        self.close_button.clicked.connect(window.close)
+        for button in (self.min_button, self.max_button, self.close_button):
+            layout.addWidget(button)
+
+    def apply_theme(self, theme: str) -> None:
+        self._theme = theme if theme in ("light", "dark") else "dark"
+        for button in (self.min_button, self.max_button, self.close_button):
+            button.set_theme(self._theme)
+
+    def _toggle_maximize(self) -> None:
+        if self._window.isMaximized():
+            self._window.showNormal()
+            self.max_button.set_kind("max")
+        else:
+            self._window.showMaximized()
+            self.max_button.set_kind("restore")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if (
+            self._drag_offset is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and not self._window.isMaximized()
+        ):
+            self._window.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._toggle_maximize()
+        super().mouseDoubleClickEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, font_family: str = DEFAULT_FONT_FAMILY):
+        super().__init__()
+        self.font_family = font_family
+        self.posts: list[PostItem] = []
+        self.loader: PostLoader | None = None
+        self.worker: DownloadWorker | None = None
+        self.preview_audit_worker: PreviewAuditWorker | None = None
+        self.preview_replace_worker: PreviewReplaceWorker | None = None
+        self._preview_busy = False
+        self.announcement_dialog: AnnouncementDialog | None = None
+        self.settings_dialog: SettingsDialog | None = None
+        self.app_settings = load_settings()
+        self.ui_theme = resolve_theme(self.app_settings.ui_theme)
+        app_instance = QApplication.instance()
+        if app_instance is not None:
+            scheme_signal = getattr(app_instance.styleHints(), "colorSchemeChanged", None)
+            if scheme_signal is not None:
+                scheme_signal.connect(self._follow_system_theme)
+        self.background_ratio = load_background_aspect_ratio()
+        self.enforces_ratio = BACKGROUND_PATH.exists()
+        self._ratio_resize_guard = False
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(load_app_icon())
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        if self.enforces_ratio:
+            self.setMinimumSize(self._ratio_size_for_width(900))
+            self.resize(self._ratio_size_for_width(1120))
+        else:
+            self.setMinimumSize(QSize(960, 680))
+            self.resize(QSize(1240, 800))
+
+        shell = QWidget()
+        shell.setObjectName("windowShell")
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self.title_bar = TitleBar(self, APP_NAME, self.ui_theme)
+        shell_layout.addWidget(self.title_bar)
+
+        root = QWidget()
+        root.setObjectName("root")
+        shell_layout.addWidget(root, 1)
+        self.setCentralWidget(shell)
+        self._shell = shell
+        self.size_grip = QSizeGrip(shell)
+        self.size_grip.setFixedSize(16, 16)
+        self.size_grip.raise_()
+
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(26, 20, 26, 20)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title = QLabel(APP_NAME)
+        title.setObjectName("titleLabel")
+        subtitle = QLabel(f"pawchive.pw · 帖子批量下载 · v{APP_VERSION}")
+        subtitle.setObjectName("subtitleLabel")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+        header.addLayout(title_col)
+        header.addStretch(1)
+        self.settings_label = QLabel(describe_settings_brief(self.app_settings))
+        self.settings_label.setObjectName("settingsSummary")
+        self.settings_label.setToolTip(
+            describe_settings(self.app_settings) + "\n点击右侧“设置”修改图片、并发、附件类型与代理"
+        )
+        header.addWidget(self.settings_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.settings_button = QPushButton("设置")
+        self.settings_button.setObjectName("ghostButton")
+        style_button(self.settings_button, 34, 88)
+        self.settings_button.setToolTip("下载图片、并发、附件类型与代理设置")
+        self.settings_button.clicked.connect(self._open_settings)
+        header.addWidget(self.settings_button, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
+
+        layout.addWidget(self._build_top_panel())
+        layout.addWidget(self._build_body(), stretch=1)
+
+        self._apply_style()
+        self._temp_timer = QTimer(self)
+        self._temp_timer.setInterval(1000)
+        self._temp_timer.timeout.connect(self._on_temp_timer)
+        self._set_running(False)
+        self._restore_output_dir()
+        self._refresh_temp_view()
+        self._log("就绪：填写创作者 URL 后点击“加载帖子”")
+        if self._program_root() is None:
+            self._log(
+                "未设置保存目录：请先点击“设置主目录”，设置后才能释放完整程序文件并开始下载。",
+                danger=True,
+            )
+
+    def _program_root(self) -> Path | None:
+        return program_root_for(self.app_settings.output_dir)
+
+    def _output_choices(self) -> list[Path]:
+        primary = self._program_root()
+        if primary is None:
+            return []
+        extras = [
+            Path(value)
+            for value in normalize_extra_output_dirs(
+                self.app_settings.extra_output_dirs, primary
+            )
+        ]
+        return [primary, *extras]
+
+    def _save_root(self) -> Path | None:
+        primary = self._program_root()
+        if primary is None:
+            return None
+        selected = normalize_storage_dir(self.app_settings.selected_output_dir)
+        if selected and any(
+            path_key(selected) == path_key(choice) for choice in self._output_choices()
+        ):
+            return Path(selected)
+        return primary
+
+    def _set_selected_output(self, path: Path) -> None:
+        self.app_settings.selected_output_dir = str(path)
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"保存目录选择保存失败: {exc}")
+
+    def _rebuild_save_path_combo(self, preferred: Path | None = None) -> None:
+        if not hasattr(self, "path_combo"):
+            return
+        self._combo_guard = True
+        self.path_combo.blockSignals(True)
+        self.path_combo.clear()
+        primary = self._program_root()
+        danger = QBrush(QColor(palette_for(self.ui_theme).danger_text))
+        if primary is None:
+            self.path_combo.addItem(
+                "请先设置保存目录（含程序文件）", None
+            )
+            self.path_combo.setItemData(
+                0, danger, Qt.ItemDataRole.ForegroundRole
+            )
+            self.path_combo.setItemData(
+                0, "未设置主保存目录，完整程序文件尚未释放", Qt.ItemDataRole.ToolTipRole
+            )
+            warning_font = QFont(self.font())
+            warning_font.setBold(True)
+            self.path_combo.setItemData(
+                0, warning_font, Qt.ItemDataRole.FontRole
+            )
+            self.browse_button.setText("设置主目录")
+            self.browse_button.setEnabled(True)
+            self.browse_button.setToolTip("首次设置主保存目录")
+            self.open_dir_button.setEnabled(False)
+            self.path_combo.blockSignals(False)
+            self._combo_guard = False
+            return
+
+        choices = self._output_choices()
+        self.path_combo.addItem(f"1. {choices[0]}（主目录 · 含程序文件）", str(choices[0]))
+        for index, path in enumerate(choices[1:], start=2):
+            self.path_combo.addItem(f"{index}. {path}", str(path))
+        self.path_combo.addItem("＋ 新增保存目录（不含程序文件）", "__add__")
+
+        selected = preferred or self._save_root() or primary
+        selected_key = path_key(selected)
+        target_index = 0
+        for index in range(self.path_combo.count()):
+            data = self.path_combo.itemData(index)
+            if data and str(data) != "__add__" and path_key(str(data)) == selected_key:
+                target_index = index
+                break
+        self.path_combo.setCurrentIndex(target_index)
+        self.path_combo.blockSignals(False)
+        self._combo_guard = False
+        self.browse_button.setText("只可迁移")
+        self.browse_button.setToolTip("主目录含程序文件，修改请到设置 → 程序文件设置 → 迁移")
+        self.open_dir_button.setEnabled(selected is not None)
+
+    def _restore_output_dir(self) -> None:
+        """启动时恢复主保存目录，并补齐 Config/Temp。"""
+        root = self._program_root()
+        self._rebuild_save_path_combo()
+        if root is None:
+            return
+        try:
+            ensure_program_layout(root)
+        except OSError as exc:
+            self._log(f"恢复保存目录失败: {root}（{exc}）", danger=True)
+            return
+        self.open_dir_button.setEnabled(True)
+        try:
+            ensure_state_dir(root)
+        except OSError as exc:
+            self._log(f"State 目录创建失败: {root}（{exc}）", danger=True)
+        active = self._save_root() or root
+        self._log(f"已恢复主保存目录: {root}")
+        if active != root:
+            self._log(f"当前下载目录: {active}")
+
+    def _remember_output_dir(self, root: Path) -> None:
+        """记录主保存根，写入注册表与 PawchiveDownload/Config/Settings.json。"""
+        self.app_settings.output_dir = str(root)
+        self.app_settings.selected_output_dir = str(root)
+        try:
+            ensure_program_layout(root)
+            ensure_state_dir(root)
+        except OSError as exc:
+            self._log(f"程序目录创建失败: {root}（{exc}）", danger=True)
+            return
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"设置保存失败: {exc}")
+
+    def _maybe_self_check(self) -> None:
+        if not needs_self_check(
+            self.app_settings.last_self_check_version, APP_VERSION
+        ):
+            return
+        self._run_self_check(startup=True)
+
+    def _run_self_check(self, startup: bool = False) -> None:
+        root = self._program_root()
+        extras = tuple(self.app_settings.extra_output_dirs) if root else ()
+        result = run_self_check(root, extras, ASSET_DIR)
+        self._log(
+            f"环境自检（v{APP_VERSION}）：{'通过' if result.passed else '发现问题'}",
+            danger=not result.passed,
+        )
+        for item in result.items:
+            if not item.ok:
+                self._log(f"自检失败 · {item.title}：{item.detail}", danger=True)
+
+        self.app_settings.last_self_check_version = APP_VERSION
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"自检版本记录保存失败: {exc}", danger=True)
+
+        if result.passed:
+            if not startup:
+                MessageDialog.show_message(
+                    self,
+                    "自检通过",
+                    "运行环境、读写权限、程序资源与保存目录均正常。",
+                    kind="success",
+                    theme=self.ui_theme,
+                )
+            return
+        lines = result.summary_lines()
+        body = "\n".join(lines[:10])
+        if len(lines) > 10:
+            body += f"\n……其余 {len(lines) - 10} 项见日志"
+        if root is None:
+            body = (
+                "首次使用尚未设置保存目录。\n"
+                "请先点击“设置主目录”，程序会在所选目录下创建 PawchiveDownload，"
+                "再释放完整程序文件并开始下载。\n\n" + body
+            )
+        MessageDialog.show_message(
+            self, "环境自检发现问题", body, kind="warning", theme=self.ui_theme
+        )
+
+    def _build_top_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("card")
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(18, 12, 18, 14)
+        box.setSpacing(10)
+
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("https://pawchive.pw/fanbox/user/xxxx")
+        self.path_combo = QComboBox()
+        self.path_combo.setFixedHeight(36)
+        self.path_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.path_combo.setMinimumContentsLength(24)
+        self.path_combo.setToolTip("主目录含程序文件，只能迁移；额外目录只保存帖子内容")
+        self.path_combo.currentIndexChanged.connect(self._on_save_path_selected)
+        self.url_input.setFixedHeight(36)
+        self._combo_guard = False
+
+        self.load_button = QPushButton("加载帖子")
+        self.load_button.setObjectName("primaryButton")
+        style_button(self.load_button, 36, 116)
+        self.browse_button = QPushButton("设置主目录")
+        self.browse_button.setObjectName("ghostButton")
+        style_button(self.browse_button, 36, 100)
+        self.browse_button.setToolTip("首次设置主保存目录；设置后主目录只能迁移")
+        self.browse_button.clicked.connect(self._browse)
+        self.open_dir_button = QPushButton("打开目录")
+        self.open_dir_button.setObjectName("ghostButton")
+        style_button(self.open_dir_button, 36, 96)
+        self.open_dir_button.setToolTip("用文件资源管理器打开当前保存目录")
+        self.open_dir_button.clicked.connect(self._open_save_dir)
+        self.open_dir_button.setEnabled(False)
+        self.load_button.clicked.connect(self._load_posts)
+
+        url_tag = QLabel("创作者 URL")
+        url_tag.setObjectName("fieldLabel")
+        url_tag.setFixedWidth(80)
+        url_row = QHBoxLayout()
+        url_row.setSpacing(10)
+        url_row.addWidget(url_tag)
+        url_row.addWidget(self.url_input, stretch=1)
+        url_row.addWidget(self.load_button)
+
+        path_tag = QLabel("保存目录")
+        path_tag.setObjectName("fieldLabel")
+        path_tag.setFixedWidth(80)
+        path_row = QHBoxLayout()
+        path_row.setSpacing(10)
+        path_row.addWidget(path_tag)
+        path_row.addWidget(self.path_combo, stretch=1)
+        path_row.addWidget(self.browse_button)
+        path_row.addWidget(self.open_dir_button)
+
+        box.addLayout(url_row)
+        box.addLayout(path_row)
+        return panel
+
+    def _open_settings(self) -> None:
+        output_root = self._program_root()
+        dialog = SettingsDialog(
+            self.app_settings,
+            self.font_family,
+            self,
+            theme=self.ui_theme,
+            output_dir=output_root,
+        )
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.app_settings = dialog.result_settings
+            new_root = program_root_for(dialog.result_output_dir)
+            if new_root is not None:
+                try:
+                    ensure_state_dir(new_root)
+                except OSError as exc:
+                    self._log(f"State 目录创建失败: {new_root}（{exc}）", danger=True)
+            try:
+                save_settings(self.app_settings)
+            except Exception as exc:
+                self._log(f"设置保存失败: {exc}", danger=True)
+            self._rebuild_save_path_combo(self._save_root())
+            self._refresh_temp_view()
+            if self.content_tabs.currentWidget() is self.save_page:
+                self._refresh_save_view()
+            new_theme = resolve_theme(self.app_settings.ui_theme)
+            if new_theme != self.ui_theme:
+                self.ui_theme = new_theme
+                self._apply_style()
+                apply_title_bar(self, self.ui_theme)
+                self._rebuild_save_path_combo(self._save_root())
+                self._log(f"界面主题已切换为{'浅色' if new_theme == 'light' else '深色'}")
+            self._refresh_settings_label()
+            if new_root is not None:
+                self._log(f"设置已更新，主保存目录: {new_root}")
+            else:
+                self._log("设置已更新")
+
+    def _refresh_settings_label(self) -> None:
+        self.settings_label.setText(describe_settings_brief(self.app_settings))
+        self.settings_label.setToolTip(
+            describe_settings(self.app_settings) + "\n点击右侧“设置”修改图片、并发、附件类型、主题与代理"
+        )
+
+    def _end_temp_extensions(self) -> None:
+        if not self.app_settings.temp_custom_extensions:
+            return
+        self.app_settings = self.app_settings.without_temp_extensions()
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"设置保存失败: {exc}")
+        self._refresh_settings_label()
+        self._log("临时自定义扩展名已取消（单次任务结束）")
+
+    def _build_body(self) -> QWidget:
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(14)
+
+        control = QWidget()
+        control.setObjectName("card")
+        control_box = QVBoxLayout(control)
+        control_box.setContentsMargins(18, 14, 18, 16)
+        control_box.setSpacing(12)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(14)
+        self.summary_label = QLabel("等待加载帖子")
+        self.summary_label.setObjectName("summaryLabel")
+        status_row.addWidget(self.summary_label, stretch=1)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(8)
+        status_row.addWidget(self.progress, stretch=2)
+        control_box.addLayout(status_row)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        self.start_button = QPushButton("开始下载")
+        self.start_button.setObjectName("primaryButton")
+        style_button(self.start_button, 36, 148)
+        self.pause_button = QPushButton("暂停")
+        self.pause_button.setObjectName("ghostButton")
+        style_button(self.pause_button, 36, 88)
+        self.resume_button = QPushButton("继续")
+        self.resume_button.setObjectName("ghostButton")
+        style_button(self.resume_button, 36, 88)
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setObjectName("dangerButton")
+        style_button(self.stop_button, 36, 88)
+        self.start_button.clicked.connect(self._start_download)
+        self.pause_button.clicked.connect(self._pause)
+        self.resume_button.clicked.connect(self._resume)
+        self.stop_button.clicked.connect(self._stop)
+        buttons.addWidget(self.start_button)
+        buttons.addSpacing(6)
+        buttons.addWidget(self.pause_button)
+        buttons.addWidget(self.resume_button)
+        buttons.addWidget(self.stop_button)
+        buttons.addStretch(1)
+        site_hint = QLabel("站点限制：同时下载 ≤5 · 约 1 请求/秒")
+        site_hint.setObjectName("hintLabel")
+        buttons.addWidget(site_hint)
+        control_box.addLayout(buttons)
+        body_layout.addWidget(control)
+
+        list_card = QWidget()
+        list_card.setObjectName("card")
+        list_box = QVBoxLayout(list_card)
+        list_box.setContentsMargins(12, 12, 12, 14)
+        list_box.setSpacing(8)
+
+        self.content_tabs = QTabWidget()
+        self.content_tabs.setObjectName("tabs")
+        self.content_tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.content_tabs.tabBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        post_page = QWidget()
+        post_layout = QVBoxLayout(post_page)
+        post_layout.setContentsMargins(0, 8, 0, 0)
+        post_layout.setSpacing(8)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
+        self.post_count_label = QLabel("尚未加载")
+        self.post_count_label.setObjectName("countLabel")
+        title_row.addWidget(self.post_count_label)
+        title_row.addStretch(1)
+        self.select_all_button = QPushButton("全选")
+        self.select_all_button.setObjectName("ghostButton")
+        style_button(self.select_all_button, 28, 64)
+        self.invert_button = QPushButton("反选")
+        self.invert_button.setObjectName("ghostButton")
+        style_button(self.invert_button, 28, 64)
+        self.select_all_button.clicked.connect(self._select_all)
+        self.invert_button.clicked.connect(self._invert_selection)
+        title_row.addWidget(self.select_all_button)
+        title_row.addWidget(self.invert_button)
+        post_layout.addLayout(title_row)
+
+        self.post_list = QListWidget()
+        self.post_list.setObjectName("postList")
+        self.post_list.setAlternatingRowColors(False)
+        self.post_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.post_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.post_list.setMinimumHeight(150)
+        post_layout.addWidget(self.post_list, stretch=1)
+        self.content_tabs.addTab(post_page, "帖子列表")
+
+        self.save_page = QWidget()
+        self.content_tabs.addTab(self.save_page, "保存目录")
+        self.content_tabs.currentChanged.connect(self._on_content_tab_changed)
+        list_box.addWidget(self.content_tabs, stretch=1)
+
+        log_card = QWidget()
+        log_card.setObjectName("card")
+        log_box = QVBoxLayout(log_card)
+        log_box.setContentsMargins(12, 12, 12, 14)
+        log_box.setSpacing(8)
+        tabs = QTabWidget()
+        tabs.setObjectName("tabs")
+        tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        tabs.tabBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.log_page = QWidget()
+        log_layout = QVBoxLayout(self.log_page)
+        log_layout.setContentsMargins(0, 8, 0, 0)
+        log_layout.setSpacing(8)
+        log_actions = QHBoxLayout()
+        log_actions.setContentsMargins(0, 0, 0, 0)
+        log_actions.setSpacing(8)
+        log_actions.addStretch(1)
+        self.log_export_button = QPushButton("导出日志")
+        self.log_export_button.setObjectName("ghostButton")
+        style_button(self.log_export_button, 30, 88)
+        self.log_export_button.setToolTip(
+            "默认保存到 PawchiveDownload/Config/Log，文件名按日期，例如 20261123.log"
+        )
+        self.log_export_button.clicked.connect(self._export_log)
+        log_actions.addWidget(self.log_export_button)
+        log_layout.addLayout(log_actions)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        log_layout.addWidget(self.log_view, stretch=1)
+        self.failed_list = QListWidget()
+        self.failed_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.temp_page = QWidget()
+        temp_layout = QVBoxLayout(self.temp_page)
+        temp_layout.setContentsMargins(0, 8, 0, 0)
+        temp_layout.setSpacing(8)
+        temp_path_row = QHBoxLayout()
+        temp_path_row.setContentsMargins(0, 0, 0, 0)
+        temp_path_row.setSpacing(8)
+        self.temp_path_view = QLineEdit()
+        self.temp_path_view.setReadOnly(True)
+        self.temp_path_view.setPlaceholderText("先选择保存目录，临时文件会自动使用 PawchiveDownload/Temp")
+        self.temp_path_view.setToolTip("下载中的 .part 与 State 下载记录所在位置（PawchiveDownload/Temp）")
+        self.temp_open_button = QPushButton("打开目录")
+        self.temp_open_button.setObjectName("ghostButton")
+        style_button(self.temp_open_button, 30, 84)
+        self.temp_open_button.clicked.connect(self._open_temp_dir)
+        self.temp_clear_button = QPushButton("清理")
+        self.temp_clear_button.setObjectName("dangerButton")
+        style_button(self.temp_clear_button, 30, 64)
+        self.temp_clear_button.setToolTip("删除当前临时根目录下的 .part 文件")
+        self.temp_clear_button.clicked.connect(self._clear_temp_files)
+        self.temp_refresh_button = QPushButton("刷新")
+        self.temp_refresh_button.setObjectName("ghostButton")
+        style_button(self.temp_refresh_button, 30, 64)
+        self.temp_refresh_button.clicked.connect(self._refresh_temp_view)
+        temp_path_row.addWidget(self.temp_path_view, stretch=1)
+        temp_layout.addLayout(temp_path_row)
+        temp_actions = QHBoxLayout()
+        temp_actions.setContentsMargins(0, 0, 0, 0)
+        temp_actions.setSpacing(8)
+        temp_actions.addStretch(1)
+        temp_actions.addWidget(self.temp_clear_button)
+        temp_actions.addWidget(self.temp_refresh_button)
+        temp_actions.addWidget(self.temp_open_button)
+        temp_layout.addLayout(temp_actions)
+        self.temp_list = QListWidget()
+        self.temp_list.setObjectName("tempList")
+        self.temp_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        temp_layout.addWidget(self.temp_list, stretch=1)
+        temp_hint = QLabel(
+            "临时文件固定放在 PawchiveDownload/Temp：.part 用于断点续传，"
+            "State 保存下载记录；清理只删除 .part，不会删除 State 记录。"
+        )
+        temp_hint.setObjectName("settingsHint")
+        temp_hint.setWordWrap(True)
+        temp_layout.addWidget(temp_hint)
+
+        self.save_page.setObjectName("savePage")
+        save_layout = QVBoxLayout(self.save_page)
+        save_layout.setContentsMargins(0, 8, 0, 0)
+        save_layout.setSpacing(8)
+        self.save_path_view = QLineEdit()
+        self.save_path_view.setReadOnly(True)
+        self.save_path_view.setPlaceholderText("先选择保存目录")
+        self.save_path_view.setToolTip("已下载内容所在目录")
+        save_layout.addWidget(self.save_path_view)
+        self.save_summary_label = QLabel("先选择保存目录")
+        self.save_summary_label.setObjectName("hintLabel")
+        self.save_summary_label.setWordWrap(True)
+        save_layout.addWidget(self.save_summary_label)
+        self.save_tree = QTreeWidget()
+        self.save_tree.setObjectName("saveTree")
+        self.save_tree.setColumnCount(3)
+        self.save_tree.setHeaderLabels(("名称", "大小", "状态"))
+        self.save_tree.setRootIsDecorated(True)
+        self.save_tree.setIndentation(16)
+        self.save_tree.setUniformRowHeights(True)
+        self.save_tree.setAnimated(False)
+        self.save_tree.setExpandsOnDoubleClick(True)
+        self.save_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        header = self.save_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        save_layout.addWidget(self.save_tree, stretch=1)
+        save_actions = QHBoxLayout()
+        save_actions.setContentsMargins(0, 0, 0, 0)
+        save_actions.setSpacing(8)
+        save_actions.addStretch(1)
+        self.save_refresh_button = QPushButton("刷新预览")
+        self.save_refresh_button.setObjectName("ghostButton")
+        style_button(self.save_refresh_button, 30, 92)
+        self.save_refresh_button.clicked.connect(self._refresh_save_view)
+        self.save_verify_button = QPushButton("校验完整性")
+        self.save_verify_button.setObjectName("ghostButton")
+        style_button(self.save_verify_button, 30, 104)
+        self.save_verify_button.clicked.connect(self._verify_save_view)
+        save_actions.addWidget(self.save_refresh_button)
+        save_actions.addWidget(self.save_verify_button)
+        save_layout.addLayout(save_actions)
+        save_hint = QLabel("只预览带 .post_id 的帖子目录；默认折叠，点击左侧三角展开；校验会对照下载记录检查缺失/大小并解码图片。")
+        save_hint.setObjectName("settingsHint")
+        save_hint.setWordWrap(True)
+        save_layout.addWidget(save_hint)
+
+        self.tabs = tabs
+        tabs.addTab(self.log_page, "日志")
+        tabs.addTab(self.failed_list, "失败文件")
+        tabs.addTab(self.temp_page, "临时目录")
+        tabs.currentChanged.connect(self._on_tab_changed)
+        log_box.addWidget(tabs, stretch=1)
+
+        main_row = QHBoxLayout()
+        main_row.setSpacing(14)
+        main_row.addWidget(list_card, stretch=3)
+        main_row.addWidget(log_card, stretch=2)
+        body_layout.addLayout(main_row, stretch=1)
+        return body
+
+    def _on_save_path_selected(self, index: int) -> None:
+        if getattr(self, "_combo_guard", False):
+            return
+        data = self.path_combo.itemData(index) if index >= 0 else None
+        if data == "__add__":
+            current = self._save_root() or self._program_root()
+            QTimer.singleShot(0, lambda: self._add_extra_path(current))
+            return
+        if not data:
+            return
+        path = Path(str(data))
+        if not path.exists():
+            dialog = MessageDialog(
+                self,
+                "目录不存在",
+                f"{path}\n\n该保存目录当前不存在，是否创建？",
+                kind="warning",
+                confirm=True,
+                theme=self.ui_theme,
+            )
+            dialog.exec()
+            if not dialog.confirmed:
+                self._rebuild_save_path_combo(self._save_root())
+                return
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                MessageDialog.show_message(
+                    self, "目录不可用", f"{path}\n\n{exc}",
+                    kind="error", theme=self.ui_theme
+                )
+                self._rebuild_save_path_combo(self._save_root())
+                return
+        self._set_selected_output(path)
+        self.open_dir_button.setEnabled(True)
+        self._refresh_temp_view()
+        if self.content_tabs.currentWidget() is self.save_page:
+            self._refresh_save_view()
+        self._log(f"当前下载目录: {path}")
+
+    def _add_extra_path(self, previous: Path | None) -> None:
+        primary = self._program_root()
+        self._rebuild_save_path_combo(previous or primary)
+        if primary is None:
+            MessageDialog.show_message(
+                self, "还没有主保存目录",
+                "请先设置主保存目录（含程序文件），再添加额外保存目录。",
+                kind="info", theme=self.ui_theme,
+            )
+            return
+        path = QFileDialog.getExistingDirectory(
+            self, "新增保存目录（不含程序文件）", str(primary.parent)
+        )
+        if not path:
+            return
+        target = normalize_storage_dir(path)
+        if not target:
+            MessageDialog.show_message(
+                self, "目录无效", "请选择本机上的绝对路径。",
+                kind="warning", theme=self.ui_theme,
+            )
+            return
+        if storage_paths_overlap(target, primary):
+            MessageDialog.show_message(
+                self, "目录不能与主目录重叠",
+                "额外保存目录不能与主保存目录相同，也不能是它的上级或子目录。\n"
+                "请换一个独立目录。",
+                kind="warning", theme=self.ui_theme,
+            )
+            return
+        merged = normalize_extra_output_dirs(
+            (*self.app_settings.extra_output_dirs, target), primary
+        )
+        if len(merged) == len(self.app_settings.extra_output_dirs):
+            MessageDialog.show_message(
+                self, "目录已存在", "这个目录已经在保存目录列表里了。",
+                kind="info", theme=self.ui_theme,
+            )
+            return
+        try:
+            Path(target).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            MessageDialog.show_message(
+                self, "目录不可用", f"{target}\n\n{exc}",
+                kind="error", theme=self.ui_theme,
+            )
+            return
+        self.app_settings.extra_output_dirs = merged
+        self.app_settings.selected_output_dir = target
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"额外保存目录保存失败: {exc}", danger=True)
+        self._rebuild_save_path_combo(Path(target))
+        self._refresh_temp_view()
+        if self.content_tabs.currentWidget() is self.save_page:
+            self._refresh_save_view()
+        self._log(f"已新增额外保存目录: {target}")
+
+    def _browse(self) -> None:
+        primary = self._program_root()
+        if primary is not None:
+            MessageDialog.show_message(
+                self,
+                "主保存目录只可迁移",
+                "保存目录含有重要的程序文件与已下载内容，如需完整迁移请在设置界面的"
+                "“程序文件设置”中使用迁移功能。\n\n"
+                "如需增加只放帖子的目录，请使用保存目录下拉菜单最底部的"
+                "“新增保存目录（不含程序文件）”。",
+                kind="warning",
+                theme=self.ui_theme,
+            )
+            return
+        path = QFileDialog.getExistingDirectory(self, "选择主保存目录")
+        if not path:
+            return
+        root = program_root_for(Path(path))
+        if root is None:
+            MessageDialog.show_message(
+                self, "保存目录无效", "请选择本机上的绝对路径。",
+                kind="warning", theme=self.ui_theme
+            )
+            return
+        self._remember_output_dir(root)
+        self._rebuild_save_path_combo(root)
+        self._refresh_temp_view()
+        self._refresh_save_view()
+        self._log(f"主保存目录已设置: {root}")
+        self._run_self_check(startup=False)
+
+    def _load_posts(self) -> None:
+        url = self.url_input.text().strip()
+        if not url:
+            MessageDialog.show_message(self, "还没有创作者 URL", "请先填写创作者 URL，再加载帖子。", kind="info", theme=self.ui_theme)
+            return
+
+        self.post_list.clear()
+        self.posts = []
+        self.load_button.setEnabled(False)
+        self.post_count_label.setText("加载中…")
+        self.summary_label.setText("正在加载帖子...")
+        self._log("开始加载帖子列表")
+        self.loader = PostLoader(url, self.app_settings)
+        self.loader.posts_loaded.connect(self._on_posts_loaded)
+        self.loader.error.connect(self._on_loader_error)
+        self.loader.log.connect(self._log)
+        self.loader.start()
+
+    def _on_posts_loaded(self, posts: list[PostItem]) -> None:
+        self.posts = posts
+        self.post_list.clear()
+        for post in posts:
+            item = QListWidgetItem(f"{post.day}  {post.title}")
+            item.setData(Qt.ItemDataRole.UserRole, post.id)
+            self.post_list.addItem(item)
+            item.setSelected(True)
+        self.summary_label.setText(f"已加载 {len(posts)} 条帖子，默认全选")
+        self.post_count_label.setText(f"{len(posts)} 条")
+        self.load_button.setEnabled(True)
+
+    def _on_loader_error(self, message: str) -> None:
+        self.load_button.setEnabled(True)
+        self.post_count_label.setText("加载失败")
+        self.summary_label.setText("加载失败")
+        self._log(f"加载失败: {message}")
+        MessageDialog.show_message(self, "加载失败", message, kind="error", theme=self.ui_theme)
+
+    def _start_download(self) -> None:
+        selected = self._selected_posts()
+        root = self._save_root()
+        program_root = self._program_root()
+        url = self.url_input.text().strip()
+        if not selected:
+            MessageDialog.show_message(self, "还没有选择帖子", "请至少勾选一条帖子再开始下载。", kind="info", theme=self.ui_theme)
+            return
+        if root is None:
+            MessageDialog.show_message(self, "还没有保存目录", "请先设置主保存目录，再开始下载。", kind="info", theme=self.ui_theme)
+            return
+        if program_root is None:
+            MessageDialog.show_message(self, "程序目录不可用", "主保存目录丢失，请重新设置。", kind="error", theme=self.ui_theme)
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            ensure_program_layout(program_root)
+            ensure_state_dir(program_root)
+        except OSError as exc:
+            MessageDialog.show_message(
+                self, "保存目录不可用", f"无法创建保存目录或程序文件：\n{root}\n\n{exc}",
+                kind="error", theme=self.ui_theme
+            )
+            return
+        if str(root) != str(self._save_root()):
+            self._rebuild_save_path_combo(root)
+        self.failed_list.clear()
+        self.progress.setValue(0)
+        self.progress.setMaximum(0)
+        self.summary_label.setText("正在准备下载任务...")
+        self._set_running(True)
+
+        self.worker = DownloadWorker(
+            creator_url=url,
+            posts=selected,
+            output_dir=root,
+            program_root=program_root,
+            settings=self.app_settings,
+        )
+        self.worker.log.connect(self._log)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.failed_file.connect(self._on_failed_file)
+        self.worker.finished.connect(self._on_download_finished)
+        self.worker.error.connect(self._on_download_error)
+        self.worker.start()
+
+    def _selected_posts(self) -> list[PostItem]:
+        selected_ids: set[str] = set()
+        for index in range(self.post_list.count()):
+            item = self.post_list.item(index)
+            if item.isSelected():
+                selected_ids.add(str(item.data(Qt.ItemDataRole.UserRole)))
+        return [post for post in self.posts if post.id in selected_ids]
+
+    def _select_all(self) -> None:
+        for index in range(self.post_list.count()):
+            self.post_list.item(index).setSelected(True)
+
+    def _invert_selection(self) -> None:
+        for index in range(self.post_list.count()):
+            item = self.post_list.item(index)
+            item.setSelected(not item.isSelected())
+
+    def _pause(self) -> None:
+        if self.worker:
+            self.worker.pause()
+            self.pause_button.setEnabled(False)
+            self.resume_button.setEnabled(True)
+            self._log("已暂停")
+
+    def _resume(self) -> None:
+        if self.worker:
+            self.worker.resume()
+            self.pause_button.setEnabled(True)
+            self.resume_button.setEnabled(False)
+            self._log("已继续")
+
+    def _stop(self) -> None:
+        if self.worker:
+            self.worker.stop()
+            self._log("正在停止...")
+
+    def _on_progress(self, done: int, total: int, failed: int) -> None:
+        self.progress.setMaximum(total)
+        self.progress.setValue(done)
+        self.summary_label.setText(f"文件进度 {done}/{total}，失败 {failed}")
+
+    def _on_failed_file(self, text: str) -> None:
+        self.failed_list.addItem(text)
+
+    def _on_download_finished(self, message: str) -> None:
+        self._log(message)
+        if self.failed_list.count():
+            root = self._program_root()
+            if root is not None:
+                failed_path = failed_export_path(root)
+                self._log(f"失败记录已导出: {failed_path}")
+        self.summary_label.setText(message)
+        self._set_running(False)
+        self._end_temp_extensions()
+        self._refresh_temp_view()
+        if self.content_tabs.currentWidget() is self.save_page:
+            self._refresh_save_view()
+
+    def _on_download_error(self, message: str) -> None:
+        self._log(f"下载出错: {message}")
+        self.summary_label.setText("下载出错")
+        self._set_running(False)
+        self._end_temp_extensions()
+        MessageDialog.show_message(self, "下载出错", message, kind="error", theme=self.ui_theme)
+
+    def _set_running(self, running: bool) -> None:
+        self._running = running
+        self.start_button.setEnabled(not running)
+        self.load_button.setEnabled(not running)
+        self.settings_button.setEnabled(not running)
+        self.pause_button.setEnabled(running)
+        self.resume_button.setEnabled(False)
+        self.stop_button.setEnabled(running)
+        if hasattr(self, "temp_clear_button") and running:
+            self.temp_clear_button.setEnabled(False)
+        if hasattr(self, "_temp_timer"):
+            if running:
+                self._temp_timer.start()
+            else:
+                self._temp_timer.stop()
+        if hasattr(self, "save_verify_button"):
+            self.save_verify_button.setEnabled(
+                not running
+                and not getattr(self, "_preview_busy", False)
+                and getattr(self, "_save_has_files", False)
+            )
+        if hasattr(self, "path_combo"):
+            self.path_combo.setEnabled(not running)
+        if hasattr(self, "browse_button"):
+            self.browse_button.setEnabled(not running)
+        if hasattr(self, "open_dir_button"):
+            self.open_dir_button.setEnabled(not running and self._save_root() is not None)
+
+    def _temp_root(self) -> Path | None:
+        return resolve_temp_root(self.app_settings, self._program_root())
+
+    def _refresh_temp_path(self) -> None:
+        root = self._temp_root()
+        text = str(root) if root else ""
+        self.temp_path_view.setText(text)
+        self.temp_path_view.setCursorPosition(0)
+        self.temp_path_view.setToolTip(text or "下载中的 .part 与 State 下载记录所在位置")
+        self.temp_open_button.setEnabled(root is not None)
+
+    def _refresh_temp_view(self) -> None:
+        self._refresh_temp_path()
+        self.temp_list.clear()
+        root = self._temp_root()
+        if root is None:
+            self.temp_list.addItem("先选择保存目录，临时文件会自动使用 PawchiveDownload/Temp")
+            self.temp_clear_button.setEnabled(False)
+            return
+        entries = iter_temp_entries(root)
+        part_files = iter_part_files(root)
+        if not entries:
+            self.temp_list.addItem("暂无临时文件或下载记录（.part 与 State 会同步显示在这里）")
+            self.temp_clear_button.setEnabled(False)
+            return
+        for path, size, kind in entries[:300]:
+            relative = path.relative_to(root).as_posix()
+            text = f"{relative}    {format_size(size)}"
+            if kind == "record":
+                text += "    [下载记录]"
+            item = QListWidgetItem(text)
+            item.setToolTip(str(path))
+            self.temp_list.addItem(item)
+        if len(entries) > 300:
+            self.temp_list.addItem(f"……还有 {len(entries) - 300} 个临时项")
+        self.temp_clear_button.setEnabled(
+            bool(part_files) and not getattr(self, "_running", False)
+        )
+
+    def _on_temp_timer(self) -> None:
+        if self.tabs.currentWidget() is self.temp_page:
+            self._refresh_temp_view()
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.temp_page:
+            self._refresh_temp_view()
+
+    def _on_content_tab_changed(self, index: int) -> None:
+        if self.content_tabs.widget(index) is self.save_page:
+            self._refresh_save_view()
+
+    def _open_temp_dir(self) -> None:
+        root = self._temp_root()
+        if root is None:
+            MessageDialog.show_message(
+                self, "还没有临时目录", "请先选择保存目录，程序会自动创建 PawchiveDownload/Temp。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            MessageDialog.show_message(
+                self, "无法创建临时目录", str(exc), kind="error", theme=self.ui_theme
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(root)))
+
+    def _clear_temp_files(self) -> None:
+        if getattr(self, "_running", False):
+            MessageDialog.show_message(
+                self, "下载进行中", "请先停止当前下载，再清理临时文件。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        root = self._temp_root()
+        if root is None:
+            MessageDialog.show_message(
+                self, "还没有临时目录", "请先选择保存目录，程序会自动创建 PawchiveDownload/Temp。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        files = iter_part_files(root)
+        if not files:
+            MessageDialog.show_message(
+                self, "没有可清理的文件", "当前临时目录里没有 .part 文件。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        total = sum(size for _, size in files)
+        dialog = MessageDialog(
+            self,
+            "清理临时文件",
+            f"将删除 {len(files)} 个未完成的 .part 文件，共 {format_size(total)}。\n"
+            "已下载完成、位于保存目录的成品文件不会受影响；State 下载记录也不会删除。",
+            kind="warning",
+            confirm=True,
+            theme=self.ui_theme,
+        )
+        dialog.exec()
+        if not dialog.confirmed:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        try:
+            deleted, freed, errors = clear_temp_root(root)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_temp_view()
+        self._log(f"已清理 {deleted} 个临时文件，释放 {format_size(freed)}")
+        if errors:
+            MessageDialog.show_message(
+                self,
+                "部分临时文件未清理",
+                "\n".join(errors[:8]),
+                kind="warning",
+                theme=self.ui_theme,
+            )
+
+    def _open_save_dir(self) -> None:
+        path = self._save_root()
+        if path is None:
+            MessageDialog.show_message(
+                self, "还没有保存目录", "请先选择保存目录。", kind="info", theme=self.ui_theme
+            )
+            return
+        if not path.exists() or not path.is_dir():
+            MessageDialog.show_message(
+                self, "保存目录不可用", f"目录不存在或不是文件夹：\n{path}",
+                kind="warning", theme=self.ui_theme
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _refresh_save_view(self) -> None:
+        root = self._save_root()
+        self.save_tree.clear()
+        self._save_has_files = False
+        if root is None:
+            self.save_path_view.clear()
+            self.save_path_view.setToolTip("先选择保存目录")
+            self.save_summary_label.setText("先选择保存目录")
+            self._set_save_placeholder("先选择保存目录")
+            self.save_refresh_button.setEnabled(False)
+            self.save_verify_button.setEnabled(False)
+            return
+        self.save_path_view.setText(str(root))
+        self.save_path_view.setCursorPosition(0)
+        self.save_path_view.setToolTip(str(root))
+        self.save_refresh_button.setEnabled(True)
+        if not root.is_dir():
+            self.save_summary_label.setText("目录不存在或不是文件夹")
+            self._set_save_placeholder("目录不存在或不是文件夹")
+            self.save_verify_button.setEnabled(False)
+            return
+
+        scan = scan_save_root(root)
+        self._populate_save_tree(scan)
+        self._save_has_files = any(post.files for post in scan.posts)
+        if not scan.posts:
+            self.save_summary_label.setText("还没有本程序下载的帖子")
+        else:
+            text = f"{len(scan.posts)} 个帖子目录 · {scan.total_files} 个文件 · {format_size(scan.total_bytes)}"
+            if scan.truncated:
+                text += " · 文件较多，仅显示前 2000 项"
+            self.save_summary_label.setText(text)
+        self.save_verify_button.setEnabled(
+            self._save_has_files and not getattr(self, "_running", False)
+        )
+
+    def _set_save_placeholder(self, text: str) -> None:
+        item = QTreeWidgetItem([text, "", ""])
+        item.setFirstColumnSpanned(True)
+        self.save_tree.addTopLevelItem(item)
+
+    def _populate_save_tree(
+        self,
+        scan: SaveScan,
+        result: VerifyResult | None = None,
+    ) -> None:
+        self.save_tree.clear()
+        if not scan.posts:
+            self._set_save_placeholder("还没有已下载的帖子")
+            return
+        danger = QBrush(QColor(palette_for(self.ui_theme).danger_text))
+        for post in scan.posts:
+            post_status = ""
+            if result is not None:
+                if post.missing_dir:
+                    post_status = "目录缺失"
+                elif not post.files:
+                    post_status = "空目录"
+                elif post.issue_count:
+                    post_status = "异常"
+                else:
+                    post_status = "正常"
+            name = post.path.name
+            if post.missing_dir:
+                name += "（目录缺失）"
+            post_item = QTreeWidgetItem([name, format_size(post.total_size), post_status])
+            post_item.setToolTip(0, str(post.path))
+            if result is not None and post_status in ("异常", "目录缺失"):
+                post_item.setForeground(2, danger)
+            self.save_tree.addTopLevelItem(post_item)
+            for item in post.files:
+                label = STATUS_LABELS.get(item.status, "—")
+                size_text = "—" if item.status == "missing" else format_size(item.size)
+                child = QTreeWidgetItem([item.path.name, size_text, label])
+                tip = str(item.path)
+                if item.detail:
+                    tip += f"\n{item.detail}"
+                child.setToolTip(0, tip)
+                child.setToolTip(2, tip)
+                if item.status and item.status != "ok":
+                    child.setForeground(2, danger)
+                post_item.addChild(child)
+        self.save_tree.collapseAll()
+
+    def _verify_save_view(self) -> None:
+        root = self._save_root()
+        program_root = self._program_root()
+        if root is None or not root.is_dir():
+            MessageDialog.show_message(
+                self, "无法校验", "请先选择一个存在的保存目录。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        state_dir = state_dir_for(program_root) if program_root is not None else None
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        try:
+            result = verify_save_root(root, state_dir=state_dir)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._populate_save_tree(result.scan, result)
+        self._save_has_files = any(post.files for post in result.scan.posts)
+        checked = result.ok_count + result.issue_count
+        if not checked:
+            summary = "保存目录里没有可校验的文件"
+        elif result.issue_count == 0:
+            summary = f"校验完成：{checked} 个文件全部正常"
+        else:
+            detail = []
+            if result.missing_count:
+                detail.append(f"缺失 {result.missing_count}")
+            if result.empty_count:
+                detail.append(f"空文件 {result.empty_count}")
+            if result.corrupt_count:
+                detail.append(f"损坏 {result.corrupt_count}")
+            if result.incomplete_count:
+                detail.append(f"未完成 {result.incomplete_count}")
+            if result.size_mismatch_count:
+                detail.append(f"大小不符 {result.size_mismatch_count}")
+            summary = f"校验完成：{result.ok_count} 正常 · {result.issue_count} 异常"
+            if detail:
+                summary += "（" + " / ".join(detail) + "）"
+        if not result.has_records and checked:
+            summary += " · 无下载记录，仅检查现有文件"
+        if result.scan.truncated:
+            summary += " · 仅显示前 2000 项"
+        self.save_summary_label.setText(summary)
+        self._log(summary)
+        self.save_verify_button.setEnabled(
+            self._save_has_files and not getattr(self, "_running", False)
+        )
+        if checked and self.app_settings.image_source == "original":
+            self._start_preview_audit(root, state_dir)
+
+    def _start_preview_audit(self, root: Path, state_dir: Path | None) -> None:
+        if getattr(self, "_preview_busy", False):
+            return
+        self._set_preview_busy(True)
+        self.save_summary_label.setText("正在检查是否有可替换的原图...")
+        self._log("开始检查预览图能否替换为原图...")
+        self.preview_audit_worker = PreviewAuditWorker(root, state_dir, self.app_settings)
+        self.preview_audit_worker.done.connect(self._on_preview_audit_done)
+        self.preview_audit_worker.error.connect(self._on_preview_audit_error)
+        self.preview_audit_worker.start()
+
+    def _set_preview_busy(self, busy: bool) -> None:
+        self._preview_busy = busy
+        busy_cursor = Qt.CursorShape.BusyCursor
+        if busy:
+            QApplication.setOverrideCursor(busy_cursor)
+        else:
+            QApplication.restoreOverrideCursor()
+        if hasattr(self, "save_verify_button"):
+            self.save_verify_button.setEnabled(
+                not busy
+                and not getattr(self, "_running", False)
+                and getattr(self, "_save_has_files", False)
+            )
+
+    def _on_preview_audit_error(self, message: str) -> None:
+        self._set_preview_busy(False)
+        self._log(f"原图检查失败: {message}", danger=True)
+        self.save_summary_label.setText("原图检查失败，可重试完整性校验")
+        MessageDialog.show_message(
+            self, "原图检查失败", message, kind="warning", theme=self.ui_theme
+        )
+
+    def _on_preview_audit_done(self, result: PreviewAuditResult) -> None:
+        self._set_preview_busy(False)
+        candidates = result.candidates or []
+        if not candidates:
+            if result.errors:
+                self._log(
+                    f"原图检查：扫描 {result.checked} 条图片记录，{len(result.errors)} 条请求失败",
+                    danger=True,
+                )
+                self.save_summary_label.setText(
+                    f"校验完成；原图检查 {len(result.errors)} 条请求失败，"
+                    "未发现可确认的原图"
+                )
+                return
+            self._log(
+                f"原图检查完成：扫描 {result.checked} 条图片记录，没有发现可替换的原图"
+            )
+            self.save_summary_label.setText(
+                f"校验完成；已检查 {result.checked} 条图片记录，无需替换原图"
+            )
+            return
+        total_size = sum(item.remote_size for item in candidates)
+        dialog = MessageDialog(
+            self,
+            "检测到预览图",
+            f"检测到该目录下 {len(candidates)} 张图片的本地文件小于远端原图，是否下载替换？\n"
+            f"预计下载 {format_size(total_size)}，替换后原预览图将被覆盖，"
+            "下载记录中的地址会同步更新。",
+            kind="warning",
+            confirm=True,
+            theme=self.ui_theme,
+        )
+        dialog.exec()
+        if not dialog.confirmed:
+            self._log(f"已取消原图替换：{len(candidates)} 张")
+            self.save_summary_label.setText(
+                f"校验完成；发现 {len(candidates)} 张可替换原图，用户取消"
+            )
+            return
+        program_root = self._program_root()
+        if program_root is None:
+            MessageDialog.show_message(
+                self, "无法替换", "主保存目录不可用。",
+                kind="error", theme=self.ui_theme
+            )
+            return
+        temp_root = resolve_temp_root(self.app_settings, program_root)
+        self._set_preview_busy(True)
+        self.save_summary_label.setText(f"正在替换原图 0/{len(candidates)}...")
+        self._log(f"开始下载替换 {len(candidates)} 张原图，共 {format_size(total_size)}")
+        self.preview_replace_worker = PreviewReplaceWorker(
+            candidates, temp_root, self.app_settings
+        )
+        self.preview_replace_worker.progress.connect(self._on_preview_replace_progress)
+        self.preview_replace_worker.done.connect(self._on_preview_replace_done)
+        self.preview_replace_worker.error.connect(self._on_preview_replace_error)
+        self.preview_replace_worker.start()
+
+    def _on_preview_replace_progress(self, done: int, total: int) -> None:
+        self.save_summary_label.setText(f"正在替换原图 {done}/{total}...")
+
+    def _on_preview_replace_done(self, count: int, errors: list) -> None:
+        self._set_preview_busy(False)
+        self._log(f"原图替换完成：成功 {count} 张，失败 {len(errors)} 张")
+        if errors:
+            MessageDialog.show_message(
+                self,
+                "部分原图替换失败",
+                "\n".join(errors[:8]),
+                kind="warning",
+                theme=self.ui_theme,
+            )
+        self._refresh_save_view()
+
+
+    def _export_log(self) -> None:
+        root = self._program_root()
+        if root is None:
+            MessageDialog.show_message(
+                self, "还没有主保存目录", "请先设置主保存目录，再导出日志。",
+                kind="info", theme=self.ui_theme
+            )
+            return
+        log_dir = program_log_dir(root)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            MessageDialog.show_message(
+                self, "日志目录不可用", f"无法创建：\n{log_dir}\n\n{exc}",
+                kind="error", theme=self.ui_theme
+            )
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d")
+        default_path = log_dir / f"{stamp}.log"
+        if default_path.exists():
+            for index in range(2, 1000):
+                candidate = log_dir / f"{stamp}_{index}.log"
+                if not candidate.exists():
+                    default_path = candidate
+                    break
+
+        chosen, _filter = QFileDialog.getSaveFileName(
+            self, "导出日志", str(default_path), "日志文件 (*.log);;文本文件 (*.txt)"
+        )
+        if not chosen:
+            return
+        target = Path(chosen)
+        if target.suffix.lower() not in (".log", ".txt"):
+            target = target.with_suffix(".log")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            header = (
+                f"Pawchive Downloader v{APP_VERSION}\n"
+                f"导出时间：{exported_at}\n"
+                f"主保存目录：{root}\n"
+                f"当前下载目录：{self._save_root() or root}\n\n"
+            )
+            target.write_text(header + self.log_view.toPlainText(), encoding="utf-8")
+        except OSError as exc:
+            MessageDialog.show_message(
+                self, "日志导出失败", f"{target}\n\n{exc}",
+                kind="error", theme=self.ui_theme
+            )
+            return
+        self._log(f"日志已导出: {target}")
+
+    def _log(self, message: str, danger: bool = False) -> None:
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self.log_view.document().characterCount() > 1:
+            cursor.insertText("\n")
+        fmt = QTextCharFormat()
+        if danger:
+            fmt.setForeground(QColor(palette_for(self.ui_theme).danger_text))
+            fmt.setFontWeight(QFont.Weight.Bold)
+        cursor.insertText(str(message), fmt)
+        self.log_view.setTextCursor(cursor)
+        self.log_view.ensureCursorVisible()
+
+    def start_announcement_loader(self) -> None:
+        """显示当前版本的更新公告；同一版本已屏蔽则不再显示。"""
+        if self.app_settings.announcement_dismissed_version == APP_VERSION:
+            return
+        text = version_announcement_text(APP_VERSION)
+        if not text:
+            self._log("未找到当前版本的更新公告内容")
+            return
+        QTimer.singleShot(0, lambda: self._show_announcement(text))
+
+    def _show_announcement(self, text: str) -> None:
+        if self.app_settings.announcement_dismissed_version == APP_VERSION:
+            return
+        dialog = AnnouncementDialog(text, self.font_family, self, version=APP_VERSION, theme=self.ui_theme)
+        dialog.closed.connect(self._on_announcement_closed)
+        self.announcement_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_announcement_closed(self, dismissed: bool) -> None:
+        self.announcement_dialog = None
+        if not dismissed:
+            return
+        self.app_settings.announcement_dismissed_version = APP_VERSION
+        try:
+            save_settings(self.app_settings)
+        except Exception as exc:
+            self._log(f"公告设置保存失败: {exc}")
+            return
+        self._log(f"公告已屏蔽：v{APP_VERSION} 内不再弹出（版本更新后恢复）")
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        apply_title_bar(self, self.ui_theme)
+        self._position_size_grip()
+
+    def _position_size_grip(self) -> None:
+        grip = getattr(self, "size_grip", None)
+        if grip is None:
+            return
+        grip.setVisible(not self.isMaximized())
+        grip.move(self._shell.width() - grip.width(), self._shell.height() - grip.height())
+        grip.raise_()
+
+    def _follow_system_theme(self, *_args) -> None:
+        if self.app_settings.ui_theme != "system":
+            return
+        new_theme = resolve_theme("system")
+        if new_theme == self.ui_theme:
+            return
+        self.ui_theme = new_theme
+        self._apply_style()
+        apply_title_bar(self, self.ui_theme)
+
+    def closeEvent(self, event) -> None:
+        if self.worker:
+            self.worker.stop()
+        event.accept()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_size_grip()
+        if not self.enforces_ratio or self._ratio_resize_guard:
+            return
+
+        size = event.size()
+        if size.height() <= 0:
+            return
+        if abs((size.width() / size.height()) - self.background_ratio) < 0.01:
+            return
+
+        old_size = event.oldSize()
+        width_changed = old_size.isValid() and abs(size.width() - old_size.width()) >= abs(
+            size.height() - old_size.height()
+        )
+        next_size = (
+            self._ratio_size_for_width(size.width())
+            if width_changed or not old_size.isValid()
+            else self._ratio_size_for_height(size.height())
+        )
+
+        self._ratio_resize_guard = True
+        self.resize(next_size)
+        self._ratio_resize_guard = False
+
+    def _ratio_size_for_width(self, width: int) -> QSize:
+        return QSize(width, max(1, round(width / self.background_ratio)))
+
+    def _ratio_size_for_height(self, height: int) -> QSize:
+        return QSize(max(1, round(height * self.background_ratio)), height)
+
+    def _apply_style(self) -> None:
+        self.setStyleSheet(
+            main_qss(
+                palette_for(self.ui_theme),
+                self.font_family,
+                background_path=BACKGROUND_PATH,
+                branch_closed_path=BRANCH_CLOSED.get(self.ui_theme),
+                branch_open_path=BRANCH_OPEN.get(self.ui_theme),
+                arrow_down_path=(
+                    ARROW_DOWN_LIGHT_PATH if self.ui_theme == "light" else ARROW_DOWN_PATH
+                ),
+            )
+        )
+        if hasattr(self, "title_bar"):
+            self.title_bar.apply_theme(self.ui_theme)
+
+
+def main() -> int:
+    set_windows_app_user_model_id()
+    app = QApplication(sys.argv)
+    font_family = load_app_font()
+    app.setFont(QFont(font_family, 10))
+    app.setWindowIcon(load_app_icon())
+    window = MainWindow(font_family)
+    window.show()
+    window._maybe_self_check()
+    window.start_announcement_loader()
+    return app.exec()
+
+
+def load_app_font() -> str:
+    if not FONT_PATH.exists():
+        return DEFAULT_FONT_FAMILY
+
+    font_id = QFontDatabase.addApplicationFont(str(FONT_PATH))
+    if font_id < 0:
+        return DEFAULT_FONT_FAMILY
+
+    families = QFontDatabase.applicationFontFamilies(font_id)
+    return families[0] if families else DEFAULT_FONT_FAMILY
+
+
+def load_app_icon() -> QIcon:
+    if not ICON_PATH.exists():
+        return QIcon()
+    return QIcon(str(ICON_PATH))
+
+
+def set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except Exception:
+        return
+
+
+def load_background_aspect_ratio() -> float:
+    pixmap = QPixmap(str(BACKGROUND_PATH))
+    if pixmap.isNull() or pixmap.height() <= 0:
+        return 16 / 9
+    return pixmap.width() / pixmap.height()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
