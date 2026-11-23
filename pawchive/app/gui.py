@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import hashlib
+import shutil
 import sys
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +71,21 @@ from pawchive.image_audit import (
     replace_preview_images,
 )
 from pawchive.release_notes import version_announcement_text
+from pawchive.updater import (
+    PROJECT_URL,
+    UpdateError,
+    cleanup_previous_update_files,
+    cleanup_update_temp,
+    current_executable,
+    download_update,
+    ensure_install_baseline,
+    expected_sha256,
+    install_update,
+    is_newer,
+    probe_github_connectivity,
+    restart_application,
+    verify_target,
+)
 from pawchive.selfcheck import needs_self_check, run_self_check
 from pawchive.verify import (
     STATUS_LABELS,
@@ -114,6 +131,7 @@ from pawchive.theme import (
     resolve_theme,
 )
 from pawchive.app.style import (
+    about_qss,
     announcement_qss,
     main_qss,
     message_qss,
@@ -421,6 +439,483 @@ class AnnouncementDialog(QDialog):
     def closeEvent(self, event) -> None:  # noqa: N802
         self.closed.emit(self.dismiss_box.isChecked())
         super().closeEvent(event)
+
+
+class UpdateWorker(QObject):
+    """在后台线程执行连通性检查、下载、校验与替换。"""
+
+    stage_changed = pyqtSignal(str)
+    progress_changed = pyqtSignal(int, int)
+    log_line = pyqtSignal(str, bool)
+    latest_version = pyqtSignal(str)
+    install_complete = pyqtSignal(str)
+    failed = pyqtSignal(str, str)
+    finished = pyqtSignal(str)
+
+    def __init__(self, current_version: str):
+        super().__init__()
+        self.current_version = current_version
+        self.cancel_event = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _emit_stage(self, text: str) -> None:
+        self.stage_changed.emit(text)
+        self.log_line.emit(text, False)
+
+    def _run(self) -> None:
+        temp_dir: Path | None = None
+        try:
+            target = current_executable()
+            if target is None:
+                raise UpdateError(
+                    "检查安装环境",
+                    "当前是源码运行模式，无法安全替换正在运行的源码；请使用发布版 exe 检查更新",
+                )
+
+            self._emit_stage("检查 GitHub 连通性与最新版本...")
+            release = probe_github_connectivity()
+            self.latest_version.emit(release.version)
+            if not is_newer(release.version, self.current_version):
+                self.finished.emit(f"当前已是最新版本 v{self.current_version}")
+                return
+
+            asset = release.exe_asset
+            if asset is None:
+                raise UpdateError("版本检查", "最新 Release 没有可下载的 exe 附件")
+            expected_hash = expected_sha256(release, asset)
+
+            self._emit_stage("校验当前程序与安装基线...")
+            target_info = verify_target(target)
+            if target_info.baseline:
+                ensure_install_baseline(target)
+                self.log_line.emit("首次更新：已建立当前程序的哈希基线", False)
+
+            self._emit_stage(f"发现新版本 v{release.version}，准备下载 {asset.name}")
+            temp_dir = Path(tempfile.mkdtemp(prefix="pawchive_update_"))
+            downloaded = temp_dir / asset.name
+            download_update(
+                asset,
+                downloaded,
+                expected_hash=expected_hash,
+                progress=self.progress_changed.emit,
+                stage=self._emit_stage,
+                cancel=self.cancel_event.is_set,
+            )
+
+            self._emit_stage("写入并替换当前程序...")
+            verify_target(target)
+            install_update(
+                downloaded,
+                target,
+                expected_hash=expected_hash,
+                progress=self.progress_changed.emit,
+                stage=self._emit_stage,
+            )
+            self._emit_stage("更新完成，准备重启程序...")
+            self.install_complete.emit(str(target))
+        except UpdateError as exc:
+            self.failed.emit(exc.stage, exc.reason)
+        except Exception as exc:
+            self.failed.emit("更新异常", f"{type(exc).__name__}: {exc}")
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class UpdateDialog(QDialog):
+    """更新过程对话框：阶段、完整性校验和复制进度均可见。"""
+
+    update_result = pyqtSignal(str, bool)
+    closed = pyqtSignal()
+
+    def __init__(
+        self,
+        current_version: str,
+        font_family: str,
+        parent: QWidget | None = None,
+        theme: str = "dark",
+        log_callback=None,
+    ):
+        super().__init__(parent)
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self.font_family = font_family
+        self.log_callback = log_callback
+        self.current_version = current_version
+        self._drag_offset = None
+        self._busy = True
+        self.setWindowTitle("检查更新")
+        self.setWindowIcon(load_app_icon())
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.resize(620, 500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title = QLabel("程序更新")
+        title.setObjectName("announcementTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.close_icon = QPushButton("✕")
+        self.close_icon.setObjectName("ghostIconButton")
+        self.close_icon.setFixedSize(30, 30)
+        self.close_icon.setToolTip("更新进行中，暂不能关闭")
+        self.close_icon.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_icon.setEnabled(False)
+        self.close_icon.clicked.connect(self.close)
+        header.addWidget(self.close_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
+        layout.addWidget(divider())
+
+        self.version_label = QLabel(f"当前版本：v{current_version}")
+        self.version_label.setObjectName("dialogHint")
+        layout.addWidget(self.version_label)
+        self.latest_label = QLabel("最新版本：检查中...")
+        self.latest_label.setObjectName("dialogHint")
+        layout.addWidget(self.latest_label)
+
+        self.progress = QProgressBar()
+        self.progress.setObjectName("updateProgress")
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.progress.setFormat("准备中")
+        layout.addWidget(self.progress)
+
+        self.status_label = QLabel("正在检查 GitHub 连通性...")
+        self.status_label.setObjectName("dialogHint")
+        layout.addWidget(self.status_label)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("updateLog")
+        self.log_view.setReadOnly(True)
+        self.log_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.log_view.setMinimumHeight(180)
+        layout.addWidget(self.log_view, stretch=1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(12)
+        self.hint_label = QLabel("更新过程中会校验更新包与当前程序完整性")
+        self.hint_label.setObjectName("dialogHint")
+        footer.addWidget(self.hint_label)
+        footer.addStretch(1)
+        self.close_button = QPushButton("关闭")
+        self.close_button.setObjectName("ghostButton")
+        style_button(self.close_button, 34, 96)
+        self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.close)
+        footer.addWidget(self.close_button)
+        layout.addLayout(footer)
+
+        self.setStyleSheet(
+            about_qss(
+                palette_for(self.theme), font_family, CHECK_ICON_PATH.as_posix()
+            )
+        )
+
+        self.worker = UpdateWorker(current_version)
+        self.worker.stage_changed.connect(self._on_stage)
+        self.worker.progress_changed.connect(self._on_progress)
+        self.worker.log_line.connect(self._append_log)
+        self.worker.latest_version.connect(self._on_latest)
+        self.worker.install_complete.connect(self._on_install_complete)
+        self.worker.failed.connect(self._on_failed)
+        self.worker.finished.connect(self._on_finished)
+        QTimer.singleShot(0, self.worker.start)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        apply_title_bar(self, self.theme)
+        if self.parentWidget() is not None:
+            center = self.parentWidget().window().frameGeometry().center()
+            self.move(center - self.rect().center())
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._busy:
+            event.ignore()
+            return
+        super().closeEvent(event)
+        self.closed.emit()
+
+    def _append_log(self, message: str, danger: bool = False) -> None:
+        cursor = self.log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self.log_view.document().characterCount() > 1:
+            cursor.insertText("\n")
+        fmt = QTextCharFormat()
+        fmt.setForeground(
+            QColor(palette_for(self.theme).danger_text if danger else palette_for(self.theme).dialog_body)
+        )
+        if danger:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        cursor.insertText(str(message), fmt)
+        self.log_view.setTextCursor(cursor)
+        self.log_view.ensureCursorVisible()
+
+    def _on_stage(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def _on_latest(self, version: str) -> None:
+        self.latest_label.setText(f"最新版本：v{version}")
+
+    def _on_progress(self, received: int, total: int) -> None:
+        if total > 0:
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(max(0, min(1000, int(received * 1000 / total))))
+            self.progress.setFormat(f"{format_size(received)} / {format_size(total)}")
+        else:
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(f"{format_size(received)}")
+
+    def _finish_busy(self) -> None:
+        self._busy = False
+        self.close_icon.setEnabled(True)
+        self.close_button.setEnabled(True)
+
+    def _on_failed(self, stage: str, reason: str) -> None:
+        self._finish_busy()
+        if self.latest_label.text() == "最新版本：检查中...":
+            self.latest_label.setText("最新版本：未获取")
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.progress.setFormat("更新失败")
+        self.status_label.setText(f"更新失败：{stage}")
+        message = f"更新失败 · {stage}：{reason}"
+        self._append_log(message, danger=True)
+        if self.log_callback is not None:
+            self.log_callback(message, True)
+        self.update_result.emit("更新失败", False)
+
+    def _on_finished(self, message: str) -> None:
+        self._finish_busy()
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(1000)
+        self.progress.setFormat("已是最新")
+        self.status_label.setText(message)
+        self._append_log(message, False)
+        if self.log_callback is not None:
+            self.log_callback(message, False)
+        self.update_result.emit(message, True)
+
+    def _on_install_complete(self, target: str) -> None:
+        self._finish_busy()
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(1000)
+        self.progress.setFormat("更新完成")
+        self.status_label.setText("更新完成，3 秒后重启程序")
+        self._append_log("更新完成，正在重启程序...", False)
+        if self.log_callback is not None:
+            self.log_callback("程序更新完成，准备重启", False)
+        self.update_result.emit("更新完成", True)
+        self.close_button.setEnabled(False)
+        self.close_icon.setEnabled(False)
+        QTimer.singleShot(3000, lambda: self._restart(target))
+
+    def _restart(self, target: str) -> None:
+        try:
+            restart_application(Path(target))
+        except UpdateError as exc:
+            self._finish_busy()
+            message = f"重启失败 · {exc.stage}：{exc.reason}"
+            self.status_label.setText("更新完成，但重启失败")
+            self._append_log(message, danger=True)
+            if self.log_callback is not None:
+                self.log_callback(message, True)
+            return
+        QApplication.quit()
+
+
+class AboutDialog(QDialog):
+    """产品信息、项目地址、版本公告与更新入口。"""
+
+    def __init__(
+        self,
+        current_version: str,
+        font_family: str,
+        parent: QWidget | None = None,
+        theme: str = "dark",
+        log_callback=None,
+    ):
+        super().__init__(parent)
+        self.theme = theme if theme in ("light", "dark") else "dark"
+        self.font_family = font_family
+        self.current_version = current_version
+        self.log_callback = log_callback
+        self.update_dialog: UpdateDialog | None = None
+        self._drag_offset = None
+        self.setWindowTitle("关于")
+        self.setWindowIcon(load_app_icon())
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.resize(620, 650)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title = QLabel("关于")
+        title.setObjectName("announcementTitle")
+        header.addWidget(title)
+        header.addStretch(1)
+        close_icon = QPushButton("✕")
+        close_icon.setObjectName("ghostIconButton")
+        close_icon.setFixedSize(30, 30)
+        close_icon.setToolTip("关闭关于窗口")
+        close_icon.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_icon.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_icon.clicked.connect(self.close)
+        header.addWidget(close_icon, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(header)
+        layout.addWidget(divider())
+
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = load_app_icon().pixmap(128, 128)
+        if not pixmap.isNull():
+            icon_label.setPixmap(pixmap)
+            icon_label.setFixedSize(136, 136)
+        layout.addWidget(icon_label)
+
+        name_label = QLabel(APP_NAME)
+        name_label.setObjectName("aboutName")
+        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(name_label)
+
+        version_label = QLabel(f"版本 v{current_version}")
+        version_label.setObjectName("aboutVersion")
+        version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(version_label)
+
+        description = QLabel(
+            "Pawchive 帖子的 Windows 桌面批量下载器。\n"
+            "支持创作者帖子加载、附件筛选、并发下载、多目录存储、\n"
+            "预览图/原图处理、启动自检、日志导出与程序更新。"
+        )
+        description.setObjectName("aboutDescription")
+        description.setWordWrap(True)
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(description)
+
+        accent = palette_for(self.theme).accent_light
+        project = QLabel(
+            f'项目地址：<a style="color:{accent}; text-decoration:none;" '
+            f'href="{PROJECT_URL}">{PROJECT_URL}</a>'
+        )
+        project.setObjectName("aboutLink")
+        project.setTextFormat(Qt.TextFormat.RichText)
+        project.setOpenExternalLinks(True)
+        project.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        layout.addWidget(project, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        section = QLabel("版本公告")
+        section.setObjectName("aboutSection")
+        layout.addWidget(section)
+
+        announcement = QPlainTextEdit()
+        announcement.setObjectName("aboutAnnouncement")
+        announcement.setReadOnly(True)
+        announcement.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        announcement.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        text = version_announcement_text(current_version) or "当前版本暂无更新公告。"
+        announcement.setPlainText(text)
+        announcement.setMaximumHeight(230)
+        layout.addWidget(announcement)
+
+        update_row = QHBoxLayout()
+        update_row.setSpacing(12)
+        self.update_state_label = QLabel("更新状态：尚未检查")
+        self.update_state_label.setObjectName("dialogHint")
+        update_row.addWidget(self.update_state_label)
+        update_row.addStretch(1)
+        self.update_button = QPushButton("检查更新")
+        self.update_button.setObjectName("primaryButton")
+        style_button(self.update_button, 34, 116)
+        self.update_button.clicked.connect(self._start_update)
+        update_row.addWidget(self.update_button)
+        layout.addLayout(update_row)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(12)
+        hint = QLabel("更新通过 GitHub Release 下载并校验完整性")
+        hint.setObjectName("dialogHint")
+        footer.addWidget(hint)
+        footer.addStretch(1)
+        close_button = QPushButton("关闭")
+        close_button.setObjectName("ghostButton")
+        style_button(close_button, 34, 96)
+        close_button.clicked.connect(self.close)
+        footer.addWidget(close_button)
+        layout.addLayout(footer)
+
+        self.setStyleSheet(
+            about_qss(
+                palette_for(self.theme), font_family, CHECK_ICON_PATH.as_posix()
+            )
+        )
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        apply_title_bar(self, self.theme)
+        if self.parentWidget() is not None:
+            center = self.parentWidget().window().frameGeometry().center()
+            self.move(center - self.rect().center())
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def _start_update(self) -> None:
+        self.update_button.setEnabled(False)
+        self.update_state_label.setText("更新状态：检查中...")
+        self.update_dialog = UpdateDialog(
+            self.current_version,
+            self.font_family,
+            self,
+            self.theme,
+            self.log_callback,
+        )
+        self.update_dialog.update_result.connect(self._on_update_result)
+        self.update_dialog.closed.connect(self._on_update_closed)
+        self.update_dialog.show()
+
+    def _on_update_result(self, message: str, success: bool) -> None:
+        self.update_state_label.setText(f"更新状态：{message}")
+
+    def _on_update_closed(self) -> None:
+        self.update_button.setEnabled(True)
 
 
 class SettingsDialog(QDialog):
@@ -1457,6 +1952,7 @@ class MainWindow(QMainWindow):
         self._preview_busy = False
         self.announcement_dialog: AnnouncementDialog | None = None
         self.settings_dialog: SettingsDialog | None = None
+        self.about_dialog: AboutDialog | None = None
         self.app_settings = load_settings()
         self.ui_theme = resolve_theme(self.app_settings.ui_theme)
         app_instance = QApplication.instance()
@@ -1522,6 +2018,12 @@ class MainWindow(QMainWindow):
         self.settings_button.setToolTip("下载图片、并发、附件类型与代理设置")
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.settings_button, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.about_button = QPushButton("关于")
+        self.about_button.setObjectName("ghostButton")
+        style_button(self.about_button, 34, 88)
+        self.about_button.setToolTip("程序说明、项目地址、版本公告与检查更新")
+        self.about_button.clicked.connect(self._open_about)
+        header.addWidget(self.about_button, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
         layout.addWidget(self._build_top_panel())
@@ -1767,6 +2269,20 @@ class MainWindow(QMainWindow):
         box.addLayout(url_row)
         box.addLayout(path_row)
         return panel
+
+    def _open_about(self) -> None:
+        if self.about_dialog is not None and self.about_dialog.isVisible():
+            self.about_dialog.raise_()
+            self.about_dialog.activateWindow()
+            return
+        self.about_dialog = AboutDialog(
+            APP_VERSION,
+            self.font_family,
+            self,
+            self.ui_theme,
+            self._log,
+        )
+        self.about_dialog.show()
 
     def _open_settings(self) -> None:
         output_root = self._program_root()
@@ -2348,6 +2864,8 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(not running)
         self.load_button.setEnabled(not running)
         self.settings_button.setEnabled(not running)
+        if hasattr(self, "about_button"):
+            self.about_button.setEnabled(not running)
         self.pause_button.setEnabled(running)
         self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(running)
@@ -2926,6 +3444,12 @@ def main() -> int:
     font_family = load_app_font()
     app.setFont(QFont(font_family, 10))
     app.setWindowIcon(load_app_icon())
+    try:
+        cleanup_previous_update_files()
+        cleanup_update_temp()
+        ensure_install_baseline()
+    except OSError:
+        pass
     window = MainWindow(font_family)
     window.show()
     window._maybe_self_check()

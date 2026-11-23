@@ -953,6 +953,80 @@ QFrame#divider {
 }
 """
 
+ABOUT_EXTRA = """
+QLabel#aboutName {
+    color: @{dialog_title};
+    font-size: 22px;
+    font-weight: 700;
+}
+QLabel#aboutVersion {
+    color: @{dialog_hint};
+    font-size: 12px;
+}
+QLabel#aboutDescription {
+    color: @{dialog_body};
+    font-size: 13px;
+}
+QLabel#aboutLink {
+    color: @{accent_light};
+    font-size: 12px;
+}
+QLabel#aboutSection {
+    color: @{section};
+    font-size: 13px;
+    font-weight: 600;
+}
+QPushButton#primaryButton {
+    background: @{primary_bg};
+    border: 1px solid @{primary_border};
+    color: @{on_primary};
+    font-weight: 600;
+}
+QPushButton#primaryButton:hover {
+    background: @{primary_hover};
+    border-color: @{primary_hover_border};
+}
+QPushButton#primaryButton:pressed {
+    background: @{primary_pressed};
+}
+QPushButton#primaryButton:disabled {
+    background: @{primary_disabled_bg};
+    border-color: @{primary_disabled_border};
+    color: @{primary_disabled_text};
+}
+QPlainTextEdit#aboutAnnouncement {
+    background: @{inner_bg};
+    border: 1px solid @{inner_border};
+    border-radius: 10px;
+    color: @{dialog_body};
+    padding: 8px;
+    selection-background-color: @{selection_bg};
+}
+QProgressBar#updateProgress {
+    min-height: 18px;
+    max-height: 18px;
+    border: none;
+    border-radius: 5px;
+    background: @{progress_bg};
+    color: @{dialog_hint};
+    text-align: center;
+    font-size: 11px;
+}
+QProgressBar#updateProgress::chunk {
+    border-radius: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 @{primary_bg}, stop:1 @{accent_light});
+}
+QPlainTextEdit#updateLog {
+    background: @{inner_bg};
+    border: 1px solid @{inner_border};
+    border-radius: 10px;
+    color: @{dialog_body};
+    padding: 8px;
+    selection-background-color: @{selection_bg};
+}
+"""
+
 MESSAGE_TEMPLATE = """
 QFrame#dialogCard {
     background: @{dialog_card_bg};
@@ -1075,6 +1149,15 @@ def announcement_qss(palette: Palette, font_family: str, check_icon: str) -> str
     )
 
 
+def about_qss(palette: Palette, font_family: str, check_icon: str) -> str:
+    return render(
+        ANNOUNCEMENT_TEMPLATE + ABOUT_EXTRA,
+        palette,
+        font_family=font_family,
+        check_icon=check_icon,
+    )
+
+
 def message_qss(palette: Palette) -> str:
     return render(MESSAGE_TEMPLATE, palette)
 
@@ -1088,5 +1171,6 @@ __all__ = [
     "main_qss",
     "settings_qss",
     "announcement_qss",
+    "about_qss",
     "message_qss",
 ]

@@ -2,7 +2,7 @@
 
 Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载、附件筛选、并发控制、保存目录管理、日志导出和预览图/原图处理。
 
-当前版本：`v1.8.1`
+当前版本：`v1.9.0`
 
 ## 功能
 
@@ -14,6 +14,9 @@ Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载�
 - 主保存目录 + 多个额外保存目录
 - 深色/浅色主题、日志导出、失败文件与临时目录预览
 - 启动自检：首次或主/次版本变化时检查环境、权限、路径、磁盘、资源和配置
+- 关于页：产品说明、项目地址、当前版本公告与 GitHub Release 检查更新
+- 程序更新：连通性预检、下载与替换进度、更新包与目标文件双重 SHA-256 校验、失败回滚与亮色日志提醒
+- GitHub Actions 烟雾测试与确定性日志分析报告
 
 ## 环境
 
@@ -50,6 +53,34 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 - 图标和界面资源在 `assets/`
 - 端口与网络相关依赖需要 `aiohttp_socks` 和 `python_socks`
 - `trio` 是 `anyio` 的可选后端，未安装不影响 asyncio 下的正常运行
+
+## 程序更新
+
+主界面“关于”弹窗中的“检查更新”通过 GitHub Release 执行更新：
+
+1. 预检 `api.github.com` 的 DNS 解析、TLS 与 HTTPS 请求；失败时写明阶段和原因，并在主界面日志页用亮色文字提醒。
+2. 读取 latest Release，比较版本号；只接受 `.exe` 更新包。
+3. 更新包必须带 `SHA256SUMS.txt`、其他校验清单或 Release asset `digest`；缺失时拒绝更新。
+4. 下载时按字节显示进度并校验 SHA-256。
+5. 校验当前程序的 PE 结构、大小和本地 `.sha256` 安装基线；首次更新会建立基线。
+6. 将运行中的旧程序重命名为 `.old` 备份，再分块写入新程序并显示复制进度；写入后回读目标文件，校验大小、PE 结构与 SHA-256；失败自动回滚。
+7. 启动新程序，旧进程退出；下次启动清理 `.old` 备份和中断的临时下载目录。
+
+发布新版本时，请在 Release 附件中同时上传 exe 与 `SHA256SUMS.txt`：
+
+```text
+<64 位 SHA-256>  PawchiveDownloader-vX.Y.Z.exe
+```
+
+可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.9.0.exe` 生成校验文件。仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
+
+程序会在 exe 同目录写入 `<exe 名>.sha256` 作为安装基线。若你手动替换了 exe，旧基线会与新文件不一致，更新器会拒绝覆盖；删除该 `.sha256` 文件后，下次启动或检查更新会为新文件重建基线。
+
+## 持续集成与日志分析
+
+- `.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行 Windows 烟雾测试。
+- `python tools/smoke_test.py` 覆盖模块导入、关于页构建、版本规则、校验解析、下载与更新替换路径，适合本地快速回归。
+- `python tools/ci_log_agent.py <日志> --report build/ci/ci-report.md` 生成确定性问题摘要、严重级别、证据、建议和置信度；CI 会上传日志与报告并写入运行摘要。分析不依赖外部模型或 Token。
 
 ## 数据目录
 
