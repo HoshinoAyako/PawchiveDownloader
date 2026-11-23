@@ -2,7 +2,7 @@
 
 Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载、附件筛选、并发控制、保存目录管理、日志导出和预览图/原图处理。
 
-当前版本：`v1.10.2`
+当前版本：`v1.11.0`
 
 版本号规则：自 `1.9.0` 起遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)；不兼容变更升主版本，向下兼容的新功能升次版本，向下兼容的问题修正升修订号。完整规则见 `CHANGELOG.md`。
 
@@ -15,7 +15,9 @@ Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载�
 - 预览图完整性校验：发现本地文件小于远端原图时可确认替换
 - 主保存目录 + 多个额外保存目录
 - 深色/浅色主题、日志导出、失败文件重试/清除与临时目录预览
-- 帖子列表与保存目录共用「仅文字 / 缩略图 / 全部展示」三种预览
+- 帖子列表与保存目录共用「仅文字 / 缩略图 / 全部展示」三种预览，切换时不重建卡片、不丢失已加载图片
+- 在线预览图磁盘缓存：默认 32 MB，可在设置 → 性能调整（0–512 MB），位于 `PawchiveDownload/Temp/PreviewCache`
+- 帖子页「刷新预览」按钮，可重新拉取当前可见帖子的预览图
 - 失败自动重试次数与间隔可在设置 → 性能调整
 - 启动自检：首次或主/次版本变化时检查环境、权限、路径、磁盘、资源和配置
 - 关于页：产品说明、项目地址、当前版本公告与 GitHub Release 检查更新
@@ -76,7 +78,8 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 <64 位 SHA-256>  PawchiveDownloader-vX.Y.Z.exe
 ```
 
-可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.10.2.exe` 生成校验文件。仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
+可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.11.0.exe` 生成校验文件。
+仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
 
 新版更新器不再在 exe 同目录生成 `<exe 名>.sha256` 安装基线；旧版本留下的该文件会在启动时删除。更新包 SHA-256 校验与写入后的目标文件回读校验仍然保留。
 

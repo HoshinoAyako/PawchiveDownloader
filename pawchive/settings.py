@@ -48,6 +48,11 @@ PREVIEW_MODE_LABELS = {
     "full": "全部展示",
 }
 
+# 在线预览图磁盘缓存：默认 32 MB，0 表示关闭缓存。
+DEFAULT_PREVIEW_CACHE_MB = 32
+MIN_PREVIEW_CACHE_MB = 0
+MAX_PREVIEW_CACHE_MB = 512
+
 # 下载失败后的自动重试：次数是首次失败后的追加次数，间隔为每次重试前的固定等待。
 DEFAULT_RETRY_COUNT = 3
 MIN_RETRY_COUNT = 1
@@ -380,6 +385,8 @@ class AppSettings:
     retry_interval: int = DEFAULT_RETRY_INTERVAL
     # 帖子列表 / 保存目录预览方式：text / thumbnail / full。
     preview_mode: str = "text"
+    # 在线预览图磁盘缓存容量（MB），0 表示关闭。
+    preview_cache_mb: int = DEFAULT_PREVIEW_CACHE_MB
     # 图片下载源：preview 走缩略图域名，original 走文件域名。
     image_source: str = "preview"
     proxy_type: str = "none"
@@ -438,6 +445,7 @@ class AppSettings:
             retry_count=self.retry_count,
             retry_interval=self.retry_interval,
             preview_mode=self.preview_mode,
+            preview_cache_mb=self.preview_cache_mb,
             image_source=self.image_source,
             proxy_type=self.proxy_type,
             proxy_address=self.proxy_address,
@@ -505,6 +513,12 @@ class AppSettings:
                 self.retry_interval, MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL, DEFAULT_RETRY_INTERVAL
             ),
             preview_mode=self.preview_mode if self.preview_mode in PREVIEW_MODE_KEYS else "text",
+            preview_cache_mb=clamp_int(
+                self.preview_cache_mb,
+                MIN_PREVIEW_CACHE_MB,
+                MAX_PREVIEW_CACHE_MB,
+                DEFAULT_PREVIEW_CACHE_MB,
+            ),
             image_source=self.image_source if self.image_source in IMAGE_SOURCE_KEYS else "preview",
             proxy_type=proxy_type,
             proxy_address=address,
@@ -528,6 +542,7 @@ def _settings_from_dict(data: dict) -> AppSettings:
         retry_count=data.get("retry_count", DEFAULT_RETRY_COUNT),
         retry_interval=data.get("retry_interval", DEFAULT_RETRY_INTERVAL),
         preview_mode=str(data.get("preview_mode", "text") or "text"),
+        preview_cache_mb=data.get("preview_cache_mb", DEFAULT_PREVIEW_CACHE_MB),
         image_source=str(data.get("image_source", "preview") or "preview"),
         proxy_type=str(data.get("proxy_type", "none")),
         proxy_address=str(data.get("proxy_address", "") or ""),
@@ -670,6 +685,7 @@ def describe_attachments(settings: AppSettings) -> str:
 def describe_settings(settings: AppSettings) -> str:
     label = f"并发 {settings.file_concurrency} / 帖子 {settings.post_concurrency}"
     label += f" / 重试 {settings.retry_count} 次×{settings.retry_interval}s"
+    label += f" / 预览缓存 {settings.preview_cache_mb}M"
     label += f" / 图片 {IMAGE_SOURCE_LABELS.get(settings.image_source, '预览图')}"
     label += f" / 附件 {describe_attachments(settings)}"
     if settings.uses_proxy:

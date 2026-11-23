@@ -267,19 +267,75 @@ def test_update_status() -> None:
 def test_settings_ranges() -> None:
     from pawchive.settings import (
         AppSettings,
+        DEFAULT_PREVIEW_CACHE_MB,
         DEFAULT_RETRY_COUNT,
         DEFAULT_RETRY_INTERVAL,
+        MAX_PREVIEW_CACHE_MB,
         MAX_RETRY_COUNT,
         MAX_RETRY_INTERVAL,
     )
 
-    settings = AppSettings(retry_count=0, retry_interval=99, preview_mode="bad").normalized()
+    settings = AppSettings(
+        retry_count=0,
+        retry_interval=99,
+        preview_mode="bad",
+        preview_cache_mb=9999,
+    ).normalized()
     assert_true(settings.retry_count == 1, "重试次数下限未生效")
     assert_true(settings.retry_interval == MAX_RETRY_INTERVAL, "重试间隔上限未生效")
     assert_true(settings.preview_mode == "text", "旧预览模式未回退")
+    assert_true(settings.preview_cache_mb == MAX_PREVIEW_CACHE_MB, "缓存容量上限未生效")
     assert_true(AppSettings().retry_count == DEFAULT_RETRY_COUNT, "默认重试次数错误")
     assert_true(AppSettings().retry_interval == DEFAULT_RETRY_INTERVAL, "默认重试间隔错误")
+    assert_true(
+        AppSettings().preview_cache_mb == DEFAULT_PREVIEW_CACHE_MB,
+        "默认预览缓存容量错误",
+    )
     assert_true(AppSettings().retry_count <= MAX_RETRY_COUNT, "默认重试次数越界")
+
+
+def test_thumbnail_cache() -> None:
+    from pawchive.thumbnail_cache import ThumbnailCache
+
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_cache_") as temp:
+        cache = ThumbnailCache(Path(temp), 4096)
+        payload = b"x" * 2048
+        cache.put("https://example.invalid/1.png", payload)
+        assert_true(cache.get("https://example.invalid/1.png") == payload, "缓存读取失败")
+        cache.put("https://example.invalid/2.png", payload)
+        cache.put("https://example.invalid/3.png", payload)
+        assert_true(cache.size_bytes() <= 4096, "缓存容量未生效")
+        assert_true(
+            cache.get("https://example.invalid/1.png") is None,
+            "缓存未按 LRU 淘汰最旧项",
+        )
+        assert_true(cache.get("https://example.invalid/3.png") == payload, "缓存新项丢失")
+        cache.configure(Path(temp), 0)
+        assert_true(cache.size_bytes() == 0, "关闭缓存时未清空旧文件")
+
+
+def test_preview_cache_path() -> None:
+    from PyQt6.QtWidgets import QApplication
+
+    from pawchive.app import gui
+    from pawchive.settings import AppSettings
+
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_cache_path_") as temp:
+        settings = AppSettings(output_dir=temp, preview_cache_mb=32).normalized()
+        original = gui.load_settings
+        gui.load_settings = lambda: settings
+        try:
+            app = QApplication.instance() or QApplication([])
+            window = gui.MainWindow(gui.load_app_font())
+            expected = Path(temp) / "PawchiveDownload" / "Temp" / "PreviewCache"
+            assert_true(window.post_preview_panel.cache_dir == expected, "预览缓存目录错误")
+            assert_true(
+                window.post_preview_panel.cache_max_bytes == 32 * 1024 * 1024,
+                "预览缓存容量未传给加载器",
+            )
+            window.close()
+        finally:
+            gui.load_settings = original
 
 
 def test_state_discard() -> None:
@@ -309,6 +365,8 @@ def test_state_discard() -> None:
 
 
 def test_preview_modes() -> None:
+    from PyQt6.QtCore import QBuffer, QIODevice
+    from PyQt6.QtGui import QColor, QPixmap
     from PyQt6.QtWidgets import QApplication
 
     from pawchive.app import gui
@@ -332,12 +390,26 @@ def test_preview_modes() -> None:
     window.post_preview_combo.setCurrentIndex(1)
     window._on_preview_mode_changed(1)
     assert_true(len(window.post_preview_panel.cards) == 2, "缩略图模式卡片数错误")
-    assert_true(window.post_preview_panel.cards[0].time_label is None, "缩略图模式不应显示时间戳")
+    first_card = window.post_preview_panel.cards[0]
+    image = QPixmap(40, 30)
+    image.fill(QColor("#336699"))
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+    assert_true(image.save(buffer, "PNG"), "测试图片编码失败")
+    assert_true(first_card.set_thumbnail_bytes(bytes(buffer.data())), "测试缩略图解码失败")
+    assert_true(first_card.has_thumbnail(), "测试缩略图未保留")
+    assert_true(first_card.time_label is not None, "缩略图模式应保留时间标签")
+    assert_true(first_card.time_label.isHidden(), "缩略图模式不应显示时间戳")
+    assert_true(first_card.title_label.isHidden(), "缩略图模式不应显示标题")
     window.post_preview_combo.setCurrentIndex(2)
     window._on_preview_mode_changed(2)
     card = window.post_preview_panel.cards[0]
-    assert_true(card.title_label is not None and card.title_label.text() == "Post 1", "全部展示标题错误")
-    assert_true(card.time_label is not None and card.time_label.text() == "2026-11-01 12:00", "全部展示时间戳错误")
+    assert_true(card is first_card, "切换预览方式不应重建卡片")
+    assert_true(card.has_thumbnail(), "切换预览方式不应丢失缩略图")
+    assert_true(card.title_label.text() == "Post 1", "全部展示标题错误")
+    assert_true(card.time_label.text() == "2026-11-01 12:00", "全部展示时间戳错误")
+    assert_true(not card.title_label.isHidden(), "全部展示标题应可见")
+    assert_true(not card.time_label.isHidden(), "全部展示时间戳应可见")
     window.close()
 
 
@@ -364,6 +436,8 @@ def main() -> int:
         ("install-rollback", test_install_and_rollback),
         ("update-status", test_update_status),
         ("settings-ranges", test_settings_ranges),
+        ("thumbnail-cache", test_thumbnail_cache),
+        ("preview-cache-path", test_preview_cache_path),
         ("state-discard", test_state_discard),
         ("preview-modes", test_preview_modes),
         ("about-dialog", test_about_dialog),

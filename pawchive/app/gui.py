@@ -88,6 +88,7 @@ from pawchive.image_audit import (
     replace_preview_images,
 )
 from pawchive.net import build_network_options
+from pawchive.thumbnail_cache import ThumbnailCache
 from pawchive.release_notes import version_announcement_text
 from pawchive.updater import (
     PROJECT_URL,
@@ -130,6 +131,8 @@ from pawchive.settings import (
     MAX_RETRY_INTERVAL,
     MIN_RETRY_COUNT,
     MIN_RETRY_INTERVAL,
+    MAX_PREVIEW_CACHE_MB,
+    MIN_PREVIEW_CACHE_MB,
     PREVIEW_MODE_KEYS,
     PREVIEW_MODE_LABELS,
     PROXY_TYPE_LABELS,
@@ -267,24 +270,33 @@ class ThumbnailLoader(QObject):
 
     _MAX_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, settings: AppSettings):
+    def __init__(
+        self,
+        settings: AppSettings,
+        *,
+        cache_dir: Path | None = None,
+        cache_max_bytes: int = 0,
+    ):
         super().__init__()
         self.settings = settings.normalized()
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self.cache = ThumbnailCache(cache_dir, cache_max_bytes)
+        self._queue: queue.Queue[tuple[str, bool] | None] = queue.Queue()
         self._requested: set[str] = set()
         self._lock = threading.Lock()
         self._workers = 3
         for _ in range(self._workers):
             threading.Thread(target=self._worker, daemon=True).start()
 
-    def request(self, url: str) -> None:
+    def request(self, url: str, *, force_network: bool = False) -> None:
         if not url:
             return
         with self._lock:
-            if url in self._requested:
+            if force_network:
+                self._requested.discard(url)
+            elif url in self._requested:
                 return
             self._requested.add(url)
-        self._queue.put(url)
+        self._queue.put((url, force_network))
 
     def stop(self) -> None:
         for _ in range(self._workers):
@@ -308,10 +320,16 @@ class ThumbnailLoader(QObject):
             **build_network_options(self.settings),
         ) as session:
             while True:
-                url = self._queue.get()
-                if url is None:
+                item = self._queue.get()
+                if item is None:
                     return
+                url, force_network = item
                 try:
+                    if not force_network:
+                        cached = self.cache.get(url)
+                        if cached:
+                            self.loaded.emit(url, cached)
+                            continue
                     async with session.get(
                         url, headers={"Referer": "https://pawchive.pw/"}
                     ) as response:
@@ -327,6 +345,7 @@ class ThumbnailLoader(QObject):
                     data = b"".join(chunks)
                     if not data:
                         raise ValueError("缩略图内容为空")
+                    self.cache.put(url, data)
                     self.loaded.emit(url, data)
                 except BaseException:
                     self.failed.emit(url)
@@ -380,15 +399,13 @@ class PreviewCard(QFrame):
             self.checkbox.setToolTip("选择这个帖子")
             self.checkbox.toggled.connect(self._on_checked)
             top.addWidget(self.checkbox, alignment=Qt.AlignmentFlag.AlignVCenter)
-        self.title_label: QLabel | None = None
-        if mode == "full":
-            self.title_label = QLabel(title)
-            self.title_label.setObjectName("previewTitle")
-            self.title_label.setToolTip(title)
-            self.title_label.setWordWrap(False)
-            self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            top.addWidget(self.title_label, 1)
-        top.addStretch(1) if self.title_label is None else None
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("previewTitle")
+        self.title_label.setToolTip(title)
+        self.title_label.setWordWrap(False)
+        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.title_label.setVisible(mode == "full")
+        top.addWidget(self.title_label, 1)
         outer.addLayout(top)
 
         self.image_label = QLabel()
@@ -398,12 +415,11 @@ class PreviewCard(QFrame):
         self.image_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         outer.addWidget(self.image_label)
 
-        self.time_label: QLabel | None = None
-        if mode == "full":
-            self.time_label = QLabel(timestamp)
-            self.time_label.setObjectName("previewTime")
-            self.time_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            outer.addWidget(self.time_label)
+        self.time_label = QLabel(timestamp)
+        self.time_label.setObjectName("previewTime")
+        self.time_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.time_label.setVisible(mode == "full")
+        outer.addWidget(self.time_label)
         outer.addStretch(1) if mode != "full" else None
 
         self._apply_selected_style()
@@ -431,6 +447,23 @@ class PreviewCard(QFrame):
 
     def is_checked(self) -> bool:
         return self._checked
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in PREVIEW_MODE_KEYS:
+            mode = "text"
+        self.mode = mode
+        show_meta = mode == "full"
+        self.title_label.setVisible(show_meta)
+        self.time_label.setVisible(show_meta)
+        self._update_title_elide()
+
+    def clear_thumbnail(self) -> None:
+        self._pixmap = None
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText("无缩略图")
+
+    def has_thumbnail(self) -> bool:
+        return self._pixmap is not None
 
     def set_local_image(self, path: Path) -> None:
         reader = QImageReader(str(path))
@@ -523,9 +556,17 @@ class MasonryPanel(QWidget):
         self.settings = settings.normalized()
         self.cards: list[PreviewCard] = []
         self.loader: ThumbnailLoader | None = None
+        self.cache_dir: Path | None = None
+        self.cache_max_bytes = 0
         self.setObjectName("previewPanel")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.setMinimumHeight(1)
+
+    def configure_cache(self, directory: Path | None, max_bytes: int) -> None:
+        self.cache_dir = directory
+        self.cache_max_bytes = max(0, int(max_bytes))
+        if self.loader is not None:
+            self.loader.cache.configure(self.cache_dir, self.cache_max_bytes)
 
     def clear(self) -> None:
         for card in self.cards:
@@ -542,10 +583,41 @@ class MasonryPanel(QWidget):
 
     def ensure_loader(self) -> ThumbnailLoader:
         if self.loader is None:
-            self.loader = ThumbnailLoader(self.settings)
+            self.loader = ThumbnailLoader(
+                self.settings,
+                cache_dir=self.cache_dir,
+                cache_max_bytes=self.cache_max_bytes,
+            )
             self.loader.loaded.connect(self._on_loaded)
             self.loader.failed.connect(self._on_failed)
         return self.loader
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in PREVIEW_MODE_KEYS:
+            return
+        self.mode = mode
+        for card in self.cards:
+            card.set_mode(mode)
+        self.relayout()
+
+    def refresh_visible(self, top: int, height: int, margin: int = 360) -> None:
+        """重新拉取当前可视区域的缩略图；本地图片直接重读。"""
+        changed = False
+        urls: set[str] = set()
+        for card in self.cards:
+            if not (card.y() < top + height + margin and card.y() + card.height() > top - margin):
+                continue
+            if card.local_image is not None:
+                card.set_local_image(card.local_image)
+                changed = True
+            elif card.thumbnail_url:
+                card.clear_thumbnail()
+                urls.add(card.thumbnail_url)
+                changed = True
+        for url in urls:
+            self.ensure_loader().request(url, force_network=True)
+        if changed:
+            self.relayout()
 
     def request_visible(self, top: int, height: int, margin: int = 360) -> None:
         for card in self.cards:
@@ -564,10 +636,16 @@ class MasonryPanel(QWidget):
 
     def _on_loaded(self, url: str, data: bytes) -> None:
         changed = False
+        decode_failed = False
         for card in self.cards:
             if card.thumbnail_url == url and card._pixmap is None:
                 if card.set_thumbnail_bytes(data):
                     changed = True
+                else:
+                    decode_failed = True
+        if decode_failed:
+            # 缓存文件损坏时不保留坏数据，下次请求会重新走网络。
+            self.ensure_loader().cache.invalidate(url)
         if changed:
             self.relayout()
 
@@ -1474,6 +1552,18 @@ class SettingsDialog(QDialog):
             f"每次自动重试前等待的固定时间，{MIN_RETRY_INTERVAL}～{MAX_RETRY_INTERVAL} 秒"
         )
 
+        self.preview_cache_spin = QSpinBox()
+        self.preview_cache_spin.setRange(MIN_PREVIEW_CACHE_MB, MAX_PREVIEW_CACHE_MB)
+        self.preview_cache_spin.setValue(self.result_settings.preview_cache_mb)
+        self.preview_cache_spin.setSuffix(" MB")
+        self.preview_cache_spin.setFixedWidth(132)
+        self.preview_cache_spin.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.preview_cache_spin.setToolTip(
+            "在线预览图缓存容量，保存在 PawchiveDownload/Temp/PreviewCache；0 表示关闭"
+        )
+
         self.image_source_combo = QComboBox()
         for key in IMAGE_SOURCE_KEYS:
             self.image_source_combo.addItem(IMAGE_SOURCE_LABELS[key], key)
@@ -1564,6 +1654,7 @@ class SettingsDialog(QDialog):
         perf_form.addRow("帖子并发数：", self.post_spin)
         perf_form.addRow("失败重试次数：", self.retry_count_spin)
         perf_form.addRow("重试间隔：", self.retry_interval_spin)
+        perf_form.addRow("预览图缓存：", self.preview_cache_spin)
         perf_form.addRow("图片下载：", self.image_source_combo)
         layout.addWidget(section_label("性能"))
         layout.addLayout(perf_form)
@@ -1982,6 +2073,7 @@ class SettingsDialog(QDialog):
             retry_count=self.retry_count_spin.value(),
             retry_interval=self.retry_interval_spin.value(),
             preview_mode=self.result_settings.preview_mode,
+            preview_cache_mb=self.preview_cache_spin.value(),
             image_source=str(self.image_source_combo.currentData() or "preview"),
             proxy_type=proxy_type,
             proxy_address=proxy_address,
@@ -2580,13 +2672,14 @@ class MainWindow(QMainWindow):
         self.settings_label = QLabel(describe_settings_brief(self.app_settings))
         self.settings_label.setObjectName("settingsSummary")
         self.settings_label.setToolTip(
-            describe_settings(self.app_settings) + "\n点击右侧“设置”修改图片、并发、附件类型与代理"
+            describe_settings(self.app_settings)
+            + "\n点击右侧“设置”修改图片、并发、附件类型、主题、代理与预览缓存"
         )
         header.addWidget(self.settings_label, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.settings_button = QPushButton("设置")
         self.settings_button.setObjectName("ghostButton")
         style_button(self.settings_button, 34, 88)
-        self.settings_button.setToolTip("下载图片、并发、附件类型与代理设置")
+        self.settings_button.setToolTip("下载图片、并发、附件类型、代理与预览缓存设置")
         self.settings_button.clicked.connect(self._open_settings)
         header.addWidget(self.settings_button, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.about_button = QPushButton("关于")
@@ -2616,6 +2709,17 @@ class MainWindow(QMainWindow):
 
     def _program_root(self) -> Path | None:
         return program_root_for(self.app_settings.output_dir)
+
+    def _configure_thumbnail_cache(self) -> None:
+        """把在线预览缓存指向 <程序根>/Temp/PreviewCache，并同步容量设置。"""
+        if not hasattr(self, "post_preview_panel"):
+            return
+        temp_root = resolve_temp_root(self.app_settings, self._program_root())
+        cache_dir = temp_root / "PreviewCache" if temp_root is not None else None
+        self.post_preview_panel.configure_cache(
+            cache_dir,
+            self.app_settings.preview_cache_mb * 1024 * 1024,
+        )
 
     def _output_choices(self) -> list[Path]:
         primary = self._program_root()
@@ -2701,6 +2805,7 @@ class MainWindow(QMainWindow):
 
     def _restore_output_dir(self) -> None:
         """启动时恢复主保存目录，并补齐 Config/Temp。"""
+        self._configure_thumbnail_cache()
         root = self._program_root()
         self._rebuild_save_path_combo()
         if root is None:
@@ -2734,6 +2839,7 @@ class MainWindow(QMainWindow):
             save_settings(self.app_settings)
         except Exception as exc:
             self._log(f"设置保存失败: {exc}")
+        self._configure_thumbnail_cache()
 
     def _maybe_self_check(self) -> None:
         if not needs_self_check(
@@ -2879,6 +2985,7 @@ class MainWindow(QMainWindow):
                 self._log(f"设置保存失败: {exc}", danger=True)
             self._rebuild_save_path_combo(self._save_root())
             self._refresh_temp_view()
+            self._configure_thumbnail_cache()
             if self.content_tabs.currentWidget() is self.save_page:
                 self._refresh_save_view()
             new_theme = resolve_theme(self.app_settings.ui_theme)
@@ -2897,7 +3004,8 @@ class MainWindow(QMainWindow):
     def _refresh_settings_label(self) -> None:
         self.settings_label.setText(describe_settings_brief(self.app_settings))
         self.settings_label.setToolTip(
-            describe_settings(self.app_settings) + "\n点击右侧“设置”修改图片、并发、附件类型、主题与代理"
+            describe_settings(self.app_settings)
+            + "\n点击右侧“设置”修改图片、并发、附件类型、主题、代理与预览缓存"
         )
 
     def _end_temp_extensions(self) -> None:
@@ -2996,6 +3104,11 @@ class MainWindow(QMainWindow):
         self.post_preview_combo.currentIndexChanged.connect(self._on_preview_mode_changed)
         title_row.addWidget(self.post_preview_combo)
         title_row.addStretch(1)
+        self.post_refresh_button = QPushButton("刷新预览")
+        self.post_refresh_button.setObjectName("ghostButton")
+        style_button(self.post_refresh_button, 28, 88)
+        self.post_refresh_button.setToolTip("重新加载当前可见帖子的在线预览图")
+        self.post_refresh_button.clicked.connect(self._refresh_post_previews)
         self.select_all_button = QPushButton("全选")
         self.select_all_button.setObjectName("ghostButton")
         style_button(self.select_all_button, 28, 64)
@@ -3004,6 +3117,7 @@ class MainWindow(QMainWindow):
         style_button(self.invert_button, 28, 64)
         self.select_all_button.clicked.connect(self._select_all)
         self.invert_button.clicked.connect(self._invert_selection)
+        title_row.addWidget(self.post_refresh_button)
         title_row.addWidget(self.select_all_button)
         title_row.addWidget(self.invert_button)
         post_layout.addLayout(title_row)
@@ -3434,14 +3548,21 @@ class MainWindow(QMainWindow):
         mode = mode if mode in PREVIEW_MODE_KEYS else "text"
         self.post_preview_panel.mode = mode
         self.post_stack.setCurrentIndex(0 if mode == "text" else 1)
+        self.post_refresh_button.setVisible(mode != "text")
         if mode != "text":
             if rebuild or len(self.post_preview_panel.cards) != len(self.posts):
                 self._populate_post_cards(mode)
             else:
-                for card in self.post_preview_panel.cards:
-                    card.mode = mode
-                self.post_preview_panel.relayout()
+                self.post_preview_panel.set_mode(mode)
             QTimer.singleShot(0, self._load_visible_thumbnails)
+
+    def _refresh_post_previews(self) -> None:
+        if self._current_preview_mode() == "text" or not self.posts:
+            return
+        top = self.post_scroll.verticalScrollBar().value()
+        height = self.post_scroll.viewport().height()
+        self.post_preview_panel.refresh_visible(top, height)
+        self._log("正在刷新当前可见帖子的预览图")
 
     def _on_preview_mode_changed(self, index: int) -> None:
         mode = str(self.post_preview_combo.itemData(index) or "text")
@@ -3456,8 +3577,8 @@ class MainWindow(QMainWindow):
             combo.blockSignals(True)
             combo.setCurrentIndex(max(0, PREVIEW_MODE_KEYS.index(mode)))
             combo.blockSignals(False)
-        self._apply_post_preview_mode(mode, rebuild=True)
-        self._apply_save_preview_mode(mode, rebuild=True)
+        self._apply_post_preview_mode(mode, rebuild=False)
+        self._apply_save_preview_mode(mode, rebuild=False)
         self._log(f"预览方式已切换：{PREVIEW_MODE_LABELS[mode]}")
 
     def _sync_selection_from_list(self) -> None:
@@ -4014,6 +4135,8 @@ class MainWindow(QMainWindow):
                         local_image=post.preview_image,
                     )
                     self.save_preview_panel.add_card(card)
+        else:
+            self.save_preview_panel.set_mode(mode)
         self.save_preview_panel.relayout()
         QTimer.singleShot(0, self._load_visible_save_thumbs)
 
