@@ -273,7 +273,8 @@ class ThumbnailLoader(QObject):
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._requested: set[str] = set()
         self._lock = threading.Lock()
-        for _ in range(3):
+        self._workers = 3
+        for _ in range(self._workers):
             threading.Thread(target=self._worker, daemon=True).start()
 
     def request(self, url: str) -> None:
@@ -286,7 +287,7 @@ class ThumbnailLoader(QObject):
         self._queue.put(url)
 
     def stop(self) -> None:
-        for _ in range(3):
+        for _ in range(self._workers):
             self._queue.put(None)
 
     def _worker(self) -> None:
@@ -316,9 +317,16 @@ class ThumbnailLoader(QObject):
                     ) as response:
                         if response.status not in (200, 206):
                             raise ValueError(f"HTTP {response.status}")
-                        data = await response.content.read(self._MAX_BYTES + 1)
-                    if not data or len(data) > self._MAX_BYTES:
-                        raise ValueError("缩略图内容为空或超过大小上限")
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.content.iter_chunked(65536):
+                            total += len(chunk)
+                            if total > self._MAX_BYTES:
+                                raise ValueError("缩略图超过大小上限")
+                            chunks.append(chunk)
+                    data = b"".join(chunks)
+                    if not data:
+                        raise ValueError("缩略图内容为空")
                     self.loaded.emit(url, data)
                 except BaseException:
                     self.failed.emit(url)
