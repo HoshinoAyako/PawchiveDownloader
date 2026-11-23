@@ -73,13 +73,16 @@ class DownloadEngine:
         self,
         concurrency: int = 8,
         retries: int = 3,
+        retry_interval: int = 5,
         chunk_size: int = 1024 * 1024,
         pause_event: threading.Event | None = None,
         stop_event: threading.Event | None = None,
         settings: AppSettings | None = None,
     ):
         self.concurrency = max(1, concurrency)
-        self.retries = max(1, retries)
+        # retries 是“首次失败后的追加重试次数”，总尝试次数为 retries + 1。
+        self.retries = max(0, retries)
+        self.retry_interval = max(0, retry_interval)
         self.chunk_size = chunk_size
         self.pause_event = pause_event or threading.Event()
         self.stop_event = stop_event or threading.Event()
@@ -291,7 +294,7 @@ class DownloadEngine:
                         message=f"开始: {task.file.name}",
                     ),
                 )
-                await self._run_task(session, task)
+                await self._run_task(session, task, on_event)
                 if state_store:
                     state_store.mark_file(task, "finished")
                 settled = True
@@ -348,6 +351,9 @@ class DownloadEngine:
                         "url": task.file.url,
                         "target_dir": str(task.save_path.parent),
                         "target_path": str(task.save_path),
+                        "temp_path": str(task.temp_path),
+                        "post": task.post,
+                        "file": task.file,
                     },
                     message=error or f"{status}: {task.file.name}",
                 ),
@@ -372,7 +378,12 @@ class DownloadEngine:
                     ),
                 )
 
-    async def _run_task(self, session: aiohttp.ClientSession, task: DownloadTask) -> None:
+    async def _run_task(
+        self,
+        session: aiohttp.ClientSession,
+        task: DownloadTask,
+        on_event: EventCallback | None = None,
+    ) -> None:
         task.save_path.parent.mkdir(parents=True, exist_ok=True)
         task.temp_path.parent.mkdir(parents=True, exist_ok=True)
         if task.file.kind == "text":
@@ -384,7 +395,7 @@ class DownloadEngine:
             return
 
         last_error: Exception | None = None
-        for attempt in range(1, self.retries + 1):
+        for attempt in range(self.retries + 1):
             await self._wait_if_paused()
             if self.stop_event.is_set():
                 raise RuntimeError("任务已停止")
@@ -394,7 +405,21 @@ class DownloadEngine:
             except Exception as exc:
                 last_error = exc
                 if attempt < self.retries:
-                    await asyncio.sleep(min(3, attempt))
+                    await emit(
+                        on_event,
+                        DownloadEvent(
+                            type="file_retry",
+                            post_id=task.post.id,
+                            file_name=task.file.name,
+                            path=task.save_path,
+                            message=(
+                                f"{task.file.name} 下载失败，{self.retry_interval} 秒后重试"
+                                f"（{attempt + 1}/{self.retries}）：{exc}"
+                            ),
+                            data={"attempt": attempt + 1, "retries": self.retries},
+                        ),
+                    )
+                    await asyncio.sleep(self.retry_interval)
         raise RuntimeError(str(last_error) if last_error else "下载失败")
 
     async def _download_file(self, session: aiohttp.ClientSession, task: DownloadTask) -> None:

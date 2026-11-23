@@ -586,6 +586,46 @@ QListWidget::item:selected {
     background: @{selection_bg};
     color: @{selection_text};
 }
+QListWidget#failedList::item {
+    min-height: 48px;
+    padding: 4px 8px;
+}
+QScrollArea#previewScroll {
+    background: transparent;
+    border: 1px solid @{list_border};
+    border-radius: 10px;
+}
+QWidget#previewPanel {
+    background: transparent;
+}
+QFrame#previewCard {
+    background: @{list_bg};
+    border: 1px solid @{list_border};
+    border-radius: 10px;
+}
+QFrame#previewCard:hover {
+    border-color: @{selection_bg};
+}
+QFrame#previewCard[selected="true"] {
+    border: 1px solid @{selection_bg};
+    background: @{card_bg};
+}
+QLabel#previewTitle {
+    color: @{list_text};
+    font-size: 13px;
+    font-weight: 600;
+}
+QLabel#previewTime {
+    color: @{hint};
+    font-size: 11px;
+    padding: 2px 8px 7px 8px;
+}
+QLabel#previewImage {
+    background: transparent;
+    color: @{hint};
+    font-size: 12px;
+    padding: 0px 4px;
+}
 QProgressBar {
     border: none;
     border-radius: 4px;

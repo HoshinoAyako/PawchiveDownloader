@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import hashlib
+import os
+import queue
+import re
 import shutil
+import ssl
 import sys
 import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 from PyQt6.QtCore import QObject, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
@@ -17,7 +22,9 @@ from PyQt6.QtGui import (
     QDesktopServices,
     QFont,
     QFontDatabase,
+    QFontMetrics,
     QIcon,
+    QImageReader,
     QPixmap,
     QTextCharFormat,
     QTextCursor,
@@ -45,7 +52,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizeGrip,
+    QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -53,9 +62,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from pawchive.api.pawchive import PawchiveApi, normalize_creator_path
+from pawchive.api.pawchive import PawchiveApi, build_file_url, normalize_creator_path
 from pawchive.downloader.engine import DownloadEngine
-from pawchive.downloader.models import DateNamingMode, DownloadEvent, PostItem
+from pawchive.downloader.models import (
+    DateNamingMode,
+    DownloadEvent,
+    DownloadTask,
+    FailedDownload,
+    FileItem,
+    PostItem,
+)
+from pawchive.downloader.naming import is_image_name
 from pawchive.downloader.service import DownloadService
 from pawchive.downloader.state import StateStore, ensure_state_dir, state_dir_for
 from pawchive.downloader.temp import (
@@ -82,6 +99,8 @@ from pawchive.updater import (
     expected_sha256,
     install_update,
     is_newer,
+    launch_update_helper,
+    pop_update_status,
     probe_github_connectivity,
     restart_application,
     verify_target,
@@ -106,6 +125,12 @@ from pawchive.settings import (
     IMAGE_SOURCE_LABELS,
     MAX_FILE_CONCURRENCY,
     MAX_POST_CONCURRENCY,
+    MAX_RETRY_COUNT,
+    MAX_RETRY_INTERVAL,
+    MIN_RETRY_COUNT,
+    MIN_RETRY_INTERVAL,
+    PREVIEW_MODE_KEYS,
+    PREVIEW_MODE_LABELS,
     PROXY_TYPE_LABELS,
     describe_settings,
     describe_settings_brief,
@@ -174,6 +199,397 @@ def format_size(size: int) -> str:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} GB"
+
+
+def format_post_time(value: str) -> str:
+    text = (value or "").strip().replace("T", " ")
+    if not text:
+        return ""
+    if len(text) >= 16:
+        return text[:16]
+    return text
+
+
+def post_thumbnail_url(post: PostItem) -> str:
+    """从帖子列表原始数据取第一张主图/图片附件，生成预览缩略图地址。"""
+    raw = post.raw if isinstance(post.raw, dict) else {}
+    candidates: list[str] = []
+    file_info = raw.get("file")
+    if isinstance(file_info, dict):
+        path = str(file_info.get("path") or "").strip()
+        name = str(file_info.get("name") or "").strip()
+        if path and (is_image_name(name) or "/data/" in path):
+            candidates.append(path)
+    attachments = raw.get("attachments")
+    if isinstance(attachments, list):
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if path and is_image_name(name):
+                candidates.append(path)
+    if not candidates:
+        return ""
+    return build_file_url(candidates[0], "image", "preview")
+
+
+def card_title(post: PostItem) -> str:
+    title = (post.title or "无标题").strip()
+    if len(title) > 46:
+        title = title[:45].rstrip() + "…"
+    return title
+
+
+def saved_post_title(post: SavedPost) -> str:
+    title = (post.title or post.path.name).strip()
+    if len(title) > 46:
+        title = title[:45].rstrip() + "…"
+    return title
+
+
+def saved_post_time(post: SavedPost) -> str:
+    text = format_post_time(post.published)
+    if text:
+        return text
+    try:
+        return datetime.fromtimestamp(post.path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    except OSError:
+        return ""
+
+
+class ThumbnailLoader(QObject):
+    """小并发异步加载网络缩略图，结果按 URL 回传，避免阻塞界面。"""
+
+    loaded = pyqtSignal(str, bytes)
+    failed = pyqtSignal(str)
+
+    _MAX_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, settings: AppSettings):
+        super().__init__()
+        self.settings = settings.normalized()
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._requested: set[str] = set()
+        self._lock = threading.Lock()
+        for _ in range(3):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    def request(self, url: str) -> None:
+        if not url:
+            return
+        with self._lock:
+            if url in self._requested:
+                return
+            self._requested.add(url)
+        self._queue.put(url)
+
+    def stop(self) -> None:
+        for _ in range(3):
+            self._queue.put(None)
+
+    def _worker(self) -> None:
+        proxy_url = self.settings.proxy_url() if self.settings.uses_proxy else None
+        if proxy_url and self.settings.proxy_type in ("http", "https"):
+            proxy = ProxyHandler({"http": proxy_url, "https": proxy_url})
+        else:
+            proxy = ProxyHandler({})
+        https = HTTPSHandler(context=ssl.create_default_context())
+        opener = build_opener(proxy, https)
+        while True:
+            url = self._queue.get()
+            if url is None:
+                return
+            try:
+                request = Request(
+                    url,
+                    headers={
+                        "User-Agent": f"PawchiveDownloader/{APP_VERSION}",
+                        "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+                        "Referer": "https://pawchive.pw/",
+                    },
+                )
+                with opener.open(request, timeout=20) as response:
+                    data = response.read(self._MAX_BYTES + 1)
+                if not data or len(data) > self._MAX_BYTES:
+                    raise ValueError("缩略图内容为空或超过大小上限")
+                self.loaded.emit(url, data)
+            except BaseException:
+                self.failed.emit(url)
+
+
+class PreviewCard(QFrame):
+    """瀑布流卡片；缩略图模式只显示图片，全部展示模式加标题和时间戳。"""
+
+    selection_changed = pyqtSignal(str, bool)
+
+    def __init__(
+        self,
+        key: str,
+        title: str,
+        timestamp: str,
+        mode: str,
+        *,
+        selectable: bool,
+        checked: bool = False,
+        thumbnail_url: str = "",
+        local_image: Path | None = None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("previewCard")
+        self.key = key
+        self.mode = mode
+        self.thumbnail_url = thumbnail_url
+        self.local_image = local_image
+        self._title_text = title
+        self._pixmap: QPixmap | None = None
+        self._aspect = 4 / 3
+        self._selectable = selectable
+        self._checked = checked
+        self._image_height = 180
+        self.setCursor(Qt.CursorShape.PointingHandCursor if selectable else Qt.CursorShape.ArrowCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(8, 7, 8, 3)
+        top.setSpacing(6)
+        self.checkbox: QCheckBox | None = None
+        if selectable:
+            self.checkbox = QCheckBox()
+            self.checkbox.setChecked(checked)
+            self.checkbox.setFixedSize(18, 18)
+            self.checkbox.setToolTip("选择这个帖子")
+            self.checkbox.toggled.connect(self._on_checked)
+            top.addWidget(self.checkbox, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.title_label: QLabel | None = None
+        if mode == "full":
+            self.title_label = QLabel(title)
+            self.title_label.setObjectName("previewTitle")
+            self.title_label.setToolTip(title)
+            self.title_label.setWordWrap(False)
+            self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            top.addWidget(self.title_label, 1)
+        top.addStretch(1) if self.title_label is None else None
+        outer.addLayout(top)
+
+        self.image_label = QLabel()
+        self.image_label.setObjectName("previewImage")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.image_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        outer.addWidget(self.image_label)
+
+        self.time_label: QLabel | None = None
+        if mode == "full":
+            self.time_label = QLabel(timestamp)
+            self.time_label.setObjectName("previewTime")
+            self.time_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            outer.addWidget(self.time_label)
+        outer.addStretch(1) if mode != "full" else None
+
+        self._apply_selected_style()
+        self.image_label.setText("无缩略图")
+
+    def _on_checked(self, checked: bool) -> None:
+        self._checked = checked
+        self._apply_selected_style()
+        self.selection_changed.emit(self.key, checked)
+
+    def _apply_selected_style(self) -> None:
+        self.setProperty("selected", "true" if self._checked else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_checked(self, checked: bool, *, emit: bool = False) -> None:
+        self._checked = checked
+        if self.checkbox is not None:
+            self.checkbox.blockSignals(True)
+            self.checkbox.setChecked(checked)
+            self.checkbox.blockSignals(False)
+        self._apply_selected_style()
+        if emit:
+            self.selection_changed.emit(self.key, checked)
+
+    def is_checked(self) -> bool:
+        return self._checked
+
+    def set_local_image(self, path: Path) -> None:
+        reader = QImageReader(str(path))
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid() and size.height() > 0:
+            self._aspect = max(0.2, min(5.0, size.width() / size.height()))
+        image = reader.read()
+        if image.isNull():
+            self.image_label.setText("缩略图读取失败")
+            return
+        self._pixmap = QPixmap.fromImage(image)
+        self._render_image()
+
+    def set_thumbnail_bytes(self, data: bytes) -> bool:
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            self.image_label.setText("缩略图读取失败")
+            return False
+        if pixmap.height() > 0:
+            self._aspect = max(0.2, min(5.0, pixmap.width() / pixmap.height()))
+        self._pixmap = pixmap
+        self._render_image()
+        return True
+
+    def set_image_area_height(self, height: int) -> None:
+        self._image_height = max(120, height)
+        self.image_label.setFixedHeight(self._image_height)
+        self._render_image()
+
+    def preferred_height(self, width: int) -> int:
+        photo_height = int(width / self._aspect)
+        photo_height = max(150, min(560, photo_height))
+        extra = 53 if self.mode == "full" else 30
+        return photo_height + extra
+
+    def _update_title_elide(self) -> None:
+        if self.title_label is None:
+            return
+        gutter = 16 + (24 if self.checkbox is not None else 0)
+        width = max(20, self.width() - gutter)
+        self.title_label.setFixedWidth(width)
+        metrics = QFontMetrics(self.title_label.font())
+        self.title_label.setText(
+            metrics.elidedText(self._title_text, Qt.TextElideMode.ElideRight, width)
+        )
+
+    def _render_image(self) -> None:
+        if self._pixmap is None:
+            return
+        target = QSize(max(40, self.image_label.width() - 2), max(40, self._image_height - 2))
+        self.image_label.setPixmap(
+            self._pixmap.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_title_elide()
+        self._render_image()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if self._selectable and event.button() == Qt.MouseButton.LeftButton:
+            if self.checkbox is not None:
+                self.checkbox.toggle()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
+class MasonryPanel(QWidget):
+    """三列瀑布流；卡片高度按图片长宽比计算，尽量少留空白。"""
+
+    selection_changed = pyqtSignal(str, bool)
+
+    def __init__(
+        self,
+        mode: str,
+        *,
+        selectable: bool,
+        settings: AppSettings,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.mode = mode
+        self.selectable = selectable
+        self.settings = settings.normalized()
+        self.cards: list[PreviewCard] = []
+        self.loader: ThumbnailLoader | None = None
+        self.setObjectName("previewPanel")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.setMinimumHeight(1)
+
+    def clear(self) -> None:
+        for card in self.cards:
+            card.setParent(None)
+            card.deleteLater()
+        self.cards = []
+        self.setMinimumHeight(1)
+
+    def add_card(self, card: PreviewCard) -> None:
+        card.selection_changed.connect(self.selection_changed)
+        card.setParent(self)
+        card.show()
+        self.cards.append(card)
+
+    def ensure_loader(self) -> ThumbnailLoader:
+        if self.loader is None:
+            self.loader = ThumbnailLoader(self.settings)
+            self.loader.loaded.connect(self._on_loaded)
+            self.loader.failed.connect(self._on_failed)
+        return self.loader
+
+    def request_visible(self, top: int, height: int, margin: int = 360) -> None:
+        for card in self.cards:
+            if card.y() < top + height + margin and card.y() + card.height() > top - margin:
+                self.request_card(card)
+
+    def request_card(self, card: PreviewCard) -> None:
+        if card.local_image is not None:
+            if card._pixmap is None:
+                card.set_local_image(card.local_image)
+                self.relayout()
+            return
+        if not card.thumbnail_url:
+            return
+        self.ensure_loader().request(card.thumbnail_url)
+
+    def _on_loaded(self, url: str, data: bytes) -> None:
+        changed = False
+        for card in self.cards:
+            if card.thumbnail_url == url and card._pixmap is None:
+                if card.set_thumbnail_bytes(data):
+                    changed = True
+        if changed:
+            self.relayout()
+
+    def _on_failed(self, url: str) -> None:
+        for card in self.cards:
+            if card.thumbnail_url == url and card._pixmap is None:
+                card.image_label.setText("缩略图加载失败")
+
+    def set_checked_keys(self, keys: set[str]) -> None:
+        for card in self.cards:
+            card.set_checked(card.key in keys)
+
+    def checked_keys(self) -> set[str]:
+        return {card.key for card in self.cards if card.is_checked()}
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.relayout()
+
+    def relayout(self) -> None:
+        width = max(1, self.width())
+        gap = 10
+        column_width = max(80, (width - gap * 2) // 3)
+        heights = [0, 0, 0]
+        for card in self.cards:
+            column = min(range(3), key=lambda index: heights[index])
+            x = column * (column_width + gap)
+            y = heights[column]
+            card.setFixedWidth(column_width)
+            total = card.preferred_height(column_width)
+            card.setFixedHeight(total)
+            extra = 53 if self.mode == "full" else 30
+            card.set_image_area_height(total - extra)
+            card.move(x, y)
+            heights[column] = y + total + gap
+        self.setMinimumHeight(max(1, max(heights) - gap))
 
 
 def section_label(text: str) -> QLabel:
@@ -504,16 +920,15 @@ class UpdateWorker(QObject):
                 cancel=self.cancel_event.is_set,
             )
 
-            self._emit_stage("写入并替换当前程序...")
-            verify_target(target)
-            install_update(
+            self._emit_stage("启动外置更新器...")
+            launch_update_helper(
                 downloaded,
                 target,
                 expected_hash=expected_hash,
-                progress=self.progress_changed.emit,
-                stage=self._emit_stage,
+                parent_pid=os.getpid(),
             )
-            self._emit_stage("更新完成，准备重启程序...")
+            temp_dir = None
+            self._emit_stage("更新器已启动，程序退出后完成替换并重启")
             self.install_complete.emit(str(target))
         except UpdateError as exc:
             self.failed.emit(exc.stage, exc.reason)
@@ -719,15 +1134,15 @@ class UpdateDialog(QDialog):
         self._finish_busy()
         self.progress.setRange(0, 1000)
         self.progress.setValue(1000)
-        self.progress.setFormat("更新完成")
-        self.status_label.setText("更新完成，3 秒后重启程序")
-        self._append_log("更新完成，正在重启程序...", False)
+        self.progress.setFormat("更新器已启动")
+        self.status_label.setText("程序即将退出，由外置更新器完成替换并重启")
+        self._append_log("外置更新器已启动；程序退出后替换，完成后自动重启。", False)
         if self.log_callback is not None:
-            self.log_callback("程序更新完成，准备重启", False)
-        self.update_result.emit("更新完成", True)
+            self.log_callback("外置更新器已启动，准备退出主程序", False)
+        self.update_result.emit("更新器已启动", True)
         self.close_button.setEnabled(False)
         self.close_icon.setEnabled(False)
-        QTimer.singleShot(3000, lambda: self._restart(target))
+        QTimer.singleShot(1200, QApplication.quit)
 
     def _restart(self, target: str) -> None:
         try:
@@ -1026,6 +1441,25 @@ class SettingsDialog(QDialog):
         self.post_spin.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.post_spin.setToolTip(f"同时解析并下载的帖子数，1～{MAX_POST_CONCURRENCY} 个")
 
+        self.retry_count_spin = QSpinBox()
+        self.retry_count_spin.setRange(MIN_RETRY_COUNT, MAX_RETRY_COUNT)
+        self.retry_count_spin.setValue(self.result_settings.retry_count)
+        self.retry_count_spin.setFixedWidth(132)
+        self.retry_count_spin.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.retry_count_spin.setToolTip(
+            "单个文件首次失败后的追加重试次数；总尝试次数 = 1 + 重试次数"
+        )
+
+        self.retry_interval_spin = QSpinBox()
+        self.retry_interval_spin.setRange(MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL)
+        self.retry_interval_spin.setValue(self.result_settings.retry_interval)
+        self.retry_interval_spin.setSuffix(" 秒")
+        self.retry_interval_spin.setFixedWidth(132)
+        self.retry_interval_spin.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.retry_interval_spin.setToolTip(
+            f"每次自动重试前等待的固定时间，{MIN_RETRY_INTERVAL}～{MAX_RETRY_INTERVAL} 秒"
+        )
+
         self.image_source_combo = QComboBox()
         for key in IMAGE_SOURCE_KEYS:
             self.image_source_combo.addItem(IMAGE_SOURCE_LABELS[key], key)
@@ -1114,6 +1548,8 @@ class SettingsDialog(QDialog):
 
         perf_form.addRow("下载并发数：", self.file_spin)
         perf_form.addRow("帖子并发数：", self.post_spin)
+        perf_form.addRow("失败重试次数：", self.retry_count_spin)
+        perf_form.addRow("重试间隔：", self.retry_interval_spin)
         perf_form.addRow("图片下载：", self.image_source_combo)
         layout.addWidget(section_label("性能"))
         layout.addLayout(perf_form)
@@ -1529,6 +1965,9 @@ class SettingsDialog(QDialog):
         self.result_settings = AppSettings(
             file_concurrency=self.file_spin.value(),
             post_concurrency=self.post_spin.value(),
+            retry_count=self.retry_count_spin.value(),
+            retry_interval=self.retry_interval_spin.value(),
+            preview_mode=self.result_settings.preview_mode,
             image_source=str(self.image_source_combo.currentData() or "preview"),
             proxy_type=proxy_type,
             proxy_address=proxy_address,
@@ -1674,6 +2113,7 @@ class DownloadWorker(QObject):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int, int)
     failed_file = pyqtSignal(str)
+    failed_item = pyqtSignal(object)
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
@@ -1695,6 +2135,8 @@ class DownloadWorker(QObject):
         self.post_concurrency = self.settings.post_concurrency
         self.naming_mode = DateNamingMode.PREFIX
         self.failed_export_path = failed_export_path(self.program_root)
+        self.state_key = ""
+        self.state_root: Path | None = None
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
         self.pause_event.set()
@@ -1736,12 +2178,16 @@ class DownloadWorker(QObject):
                 path_key(self.output_dir).encode("utf-8", "ignore")
             ).hexdigest()[:10]
             state_key = f"{state_key}_{digest}"
+        self.state_key = state_key
+        self.state_root = state_root
         state = StateStore(
             state_key,
             root=state_root,
         )
         engine = DownloadEngine(
             concurrency=self.concurrency,
+            retries=self.settings.retry_count,
+            retry_interval=self.settings.retry_interval,
             pause_event=self.pause_event,
             stop_event=self.stop_event,
             settings=self.settings,
@@ -1776,12 +2222,17 @@ class DownloadWorker(QObject):
                 self.progress.emit(event.done or 0, event.total or 0, event.failed or 0)
             elif event.type == "file_finished":
                 self.log.emit(f"完成: {event.file_name}")
+            elif event.type == "file_retry":
+                self.log.emit(event.message)
             elif event.type == "file_skipped":
                 self.log.emit(f"跳过: {event.file_name}")
             elif event.type == "file_failed":
                 text = self._format_failed_event(event)
                 self._append_failed_export(text)
                 self.failed_file.emit(f"{event.file_name} | {event.path}")
+                failed = self._failed_download(event)
+                if failed is not None:
+                    self.failed_item.emit(failed)
                 self.log.emit(f"失败: {event.file_name} - {event.message}")
             elif event.type == "post_finished":
                 if event.failed:
@@ -1790,6 +2241,26 @@ class DownloadWorker(QObject):
                 self.finished.emit(event.message)
 
         await engine.run_stream(task_batches(), state, on_event)
+
+    def _failed_download(self, event: DownloadEvent) -> FailedDownload | None:
+        data = event.data or {}
+        post = data.get("post")
+        file_item = data.get("file")
+        if not isinstance(post, PostItem) or not isinstance(file_item, FileItem):
+            return None
+        target = Path(str(data.get("target_path") or event.path or ""))
+        temp = Path(str(data.get("temp_path") or ""))
+        if not target or not temp:
+            return None
+        return FailedDownload(
+            post=post,
+            file=file_item,
+            save_path=target,
+            temp_path=temp,
+            error=event.message or "下载失败",
+            state_key=self.state_key,
+            state_root=self.state_root,
+        )
 
     def _format_failed_event(self, event: DownloadEvent) -> str:
         data = event.data or {}
@@ -1813,6 +2284,86 @@ class DownloadWorker(QObject):
             if first_write:
                 file.write("# Pawchive Downloader failed files\n\n")
             file.write(text)
+
+
+class RetryWorker(QObject):
+    """手动重试失败文件；只处理传入的任务，不重新整理帖子。"""
+
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int, int, int)
+    recovered = pyqtSignal(object)
+    still_failed = pyqtSignal(object)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        items: list[FailedDownload],
+        output_dir: Path,
+        settings: AppSettings,
+    ):
+        super().__init__()
+        self.items = list(items)
+        self.output_dir = output_dir
+        self.settings = settings.normalized()
+        self.stop_event = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+    async def _main(self) -> None:
+        if not self.items:
+            self.finished.emit("没有可重试的失败文件")
+            return
+        by_key = {item.key: item for item in self.items}
+        first = self.items[0]
+        state = None
+        if first.state_key and first.state_root is not None:
+            state = StateStore(first.state_key, root=first.state_root)
+        tasks = [item.as_task() for item in self.items]
+        engine = DownloadEngine(
+            concurrency=self.settings.file_concurrency,
+            retries=self.settings.retry_count,
+            retry_interval=self.settings.retry_interval,
+            stop_event=self.stop_event,
+            settings=self.settings,
+        )
+
+        def lookup(event: DownloadEvent) -> FailedDownload | None:
+            return by_key.get((event.post_id or "", event.file_name or "", str(event.path or "")))
+
+        def on_event(event: DownloadEvent) -> None:
+            if event.type == "progress":
+                self.progress.emit(event.done or 0, event.total or 0, event.failed or 0)
+            elif event.type == "file_retry":
+                self.log.emit(event.message)
+            elif event.type == "file_finished":
+                item = lookup(event)
+                if item is not None:
+                    self.recovered.emit(item)
+            elif event.type == "file_skipped":
+                item = lookup(event)
+                if item is not None:
+                    self.recovered.emit(item)
+            elif event.type == "file_failed":
+                item = lookup(event)
+                if item is not None:
+                    item.error = event.message or item.error
+                    self.still_failed.emit(item)
+                self.log.emit(f"重试失败: {event.file_name} - {event.message}")
+
+        self.log.emit(f"开始重试 {len(tasks)} 个失败文件（每次重试间隔 {self.settings.retry_interval} 秒）")
+        await engine.run(tasks, state, on_event)
+        self.finished.emit(f"重试结束，处理 {len(tasks)} 个文件")
 
 
 class TitleBarButton(QPushButton):
@@ -1944,6 +2495,15 @@ class MainWindow(QMainWindow):
         self.posts: list[PostItem] = []
         self.loader: PostLoader | None = None
         self.worker: DownloadWorker | None = None
+        self.retry_worker: RetryWorker | None = None
+        self._failed_items: dict[tuple[str, str, str], FailedDownload] = {}
+        self._selected_post_ids: set[str] = set()
+        self._save_scan: SaveScan | None = None
+        self._running = False
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(120)
+        self._thumb_timer.timeout.connect(self._load_visible_thumbnails)
         self.preview_audit_worker: PreviewAuditWorker | None = None
         self.preview_replace_worker: PreviewReplaceWorker | None = None
         self._preview_busy = False
@@ -2412,6 +2972,15 @@ class MainWindow(QMainWindow):
         self.post_count_label = QLabel("尚未加载")
         self.post_count_label.setObjectName("countLabel")
         title_row.addWidget(self.post_count_label)
+        title_row.addWidget(QLabel("预览："))
+        self.post_preview_combo = QComboBox()
+        self.post_preview_combo.setFixedWidth(108)
+        for key in PREVIEW_MODE_KEYS:
+            self.post_preview_combo.addItem(PREVIEW_MODE_LABELS[key], key)
+        current_mode = self.app_settings.preview_mode if self.app_settings.preview_mode in PREVIEW_MODE_KEYS else "text"
+        self.post_preview_combo.setCurrentIndex(max(0, PREVIEW_MODE_KEYS.index(current_mode)))
+        self.post_preview_combo.currentIndexChanged.connect(self._on_preview_mode_changed)
+        title_row.addWidget(self.post_preview_combo)
         title_row.addStretch(1)
         self.select_all_button = QPushButton("全选")
         self.select_all_button.setObjectName("ghostButton")
@@ -2431,7 +3000,27 @@ class MainWindow(QMainWindow):
         self.post_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.post_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.post_list.setMinimumHeight(150)
-        post_layout.addWidget(self.post_list, stretch=1)
+        self.post_list.itemSelectionChanged.connect(self._sync_selection_from_list)
+
+        self.post_stack = QStackedWidget()
+        self.post_stack.addWidget(self.post_list)
+        self.post_scroll = QScrollArea()
+        self.post_scroll.setObjectName("previewScroll")
+        self.post_scroll.setWidgetResizable(True)
+        self.post_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.post_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.post_preview_panel = MasonryPanel(
+            current_mode,
+            selectable=True,
+            settings=self.app_settings,
+            parent=self.post_scroll,
+        )
+        self.post_preview_panel.selection_changed.connect(self._on_card_selection)
+        self.post_scroll.setWidget(self.post_preview_panel)
+        self.post_scroll.verticalScrollBar().valueChanged.connect(self._queue_visible_thumbnails)
+        self.post_stack.addWidget(self.post_scroll)
+        post_layout.addWidget(self.post_stack, stretch=1)
+        self._apply_post_preview_mode(current_mode, rebuild=True)
         self.content_tabs.addTab(post_page, "帖子列表")
 
         self.save_page = QWidget()
@@ -2468,8 +3057,34 @@ class MainWindow(QMainWindow):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         log_layout.addWidget(self.log_view, stretch=1)
+        self.failed_page = QWidget()
+        failed_layout = QVBoxLayout(self.failed_page)
+        failed_layout.setContentsMargins(0, 8, 0, 0)
+        failed_layout.setSpacing(8)
+        failed_actions = QHBoxLayout()
+        failed_actions.setContentsMargins(0, 0, 0, 0)
+        failed_actions.setSpacing(8)
+        self.failed_hint = QLabel("下载失败的文件可多选后重试；清除会删除失败内容、.part 缓存和对应状态记录。")
+        self.failed_hint.setObjectName("settingsHint")
+        self.failed_hint.setWordWrap(True)
+        failed_actions.addWidget(self.failed_hint, stretch=1)
+        self.retry_failed_button = QPushButton("重试选中")
+        self.retry_failed_button.setObjectName("ghostButton")
+        style_button(self.retry_failed_button, 30, 92)
+        self.retry_failed_button.clicked.connect(self._retry_failed_items)
+        self.clear_failed_button = QPushButton("清除选中")
+        self.clear_failed_button.setObjectName("dangerButton")
+        style_button(self.clear_failed_button, 30, 92)
+        self.clear_failed_button.clicked.connect(self._clear_failed_items)
+        failed_actions.addWidget(self.retry_failed_button)
+        failed_actions.addWidget(self.clear_failed_button)
+        failed_layout.addLayout(failed_actions)
         self.failed_list = QListWidget()
+        self.failed_list.setObjectName("failedList")
         self.failed_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.failed_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        failed_layout.addWidget(self.failed_list, stretch=1)
+        self._update_failed_buttons()
         self.temp_page = QWidget()
         temp_layout = QVBoxLayout(self.temp_page)
         temp_layout.setContentsMargins(0, 8, 0, 0)
@@ -2543,10 +3158,35 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        save_layout.addWidget(self.save_tree, stretch=1)
+
+        self.save_stack = QStackedWidget()
+        self.save_stack.addWidget(self.save_tree)
+        self.save_scroll = QScrollArea()
+        self.save_scroll.setObjectName("previewScroll")
+        self.save_scroll.setWidgetResizable(True)
+        self.save_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.save_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.save_preview_panel = MasonryPanel(
+            current_mode,
+            selectable=False,
+            settings=self.app_settings,
+            parent=self.save_scroll,
+        )
+        self.save_scroll.setWidget(self.save_preview_panel)
+        self.save_scroll.verticalScrollBar().valueChanged.connect(self._queue_visible_save_thumbnails)
+        self.save_stack.addWidget(self.save_scroll)
+        save_layout.addWidget(self.save_stack, stretch=1)
         save_actions = QHBoxLayout()
         save_actions.setContentsMargins(0, 0, 0, 0)
         save_actions.setSpacing(8)
+        save_actions.addWidget(QLabel("预览："))
+        self.save_preview_combo = QComboBox()
+        self.save_preview_combo.setFixedWidth(108)
+        for key in PREVIEW_MODE_KEYS:
+            self.save_preview_combo.addItem(PREVIEW_MODE_LABELS[key], key)
+        self.save_preview_combo.setCurrentIndex(max(0, PREVIEW_MODE_KEYS.index(current_mode)))
+        self.save_preview_combo.currentIndexChanged.connect(self._on_preview_mode_changed)
+        save_actions.addWidget(self.save_preview_combo)
         save_actions.addStretch(1)
         self.save_refresh_button = QPushButton("刷新预览")
         self.save_refresh_button.setObjectName("ghostButton")
@@ -2559,14 +3199,17 @@ class MainWindow(QMainWindow):
         save_actions.addWidget(self.save_refresh_button)
         save_actions.addWidget(self.save_verify_button)
         save_layout.addLayout(save_actions)
-        save_hint = QLabel("只预览带 .post_id 的帖子目录；默认折叠，点击左侧三角展开；校验会对照下载记录检查缺失/大小并解码图片。")
+        save_hint = QLabel(
+            "只预览带 .post_id 的帖子目录；仅文字模式保留树形结构，缩略图/全部展示模式改为卡片预览。"
+            "校验会对照下载记录检查缺失/大小并解码图片。"
+        )
         save_hint.setObjectName("settingsHint")
         save_hint.setWordWrap(True)
         save_layout.addWidget(save_hint)
 
         self.tabs = tabs
         tabs.addTab(self.log_page, "日志")
-        tabs.addTab(self.failed_list, "失败文件")
+        tabs.addTab(self.failed_page, "失败文件")
         tabs.addTab(self.temp_page, "临时目录")
         tabs.currentChanged.connect(self._on_tab_changed)
         log_box.addWidget(tabs, stretch=1)
@@ -2715,7 +3358,9 @@ class MainWindow(QMainWindow):
             return
 
         self.post_list.clear()
+        self.post_preview_panel.clear()
         self.posts = []
+        self._selected_post_ids.clear()
         self.load_button.setEnabled(False)
         self.post_count_label.setText("加载中…")
         self.summary_label.setText("正在加载帖子...")
@@ -2728,12 +3373,16 @@ class MainWindow(QMainWindow):
 
     def _on_posts_loaded(self, posts: list[PostItem]) -> None:
         self.posts = posts
+        self._selected_post_ids = {post.id for post in posts}
+        self.post_list.blockSignals(True)
         self.post_list.clear()
         for post in posts:
             item = QListWidgetItem(f"{post.day}  {post.title}")
             item.setData(Qt.ItemDataRole.UserRole, post.id)
             self.post_list.addItem(item)
             item.setSelected(True)
+        self.post_list.blockSignals(False)
+        self._apply_post_preview_mode(self._current_preview_mode(), rebuild=True)
         self.summary_label.setText(f"已加载 {len(posts)} 条帖子，默认全选")
         self.post_count_label.setText(f"{len(posts)} 条")
         self.load_button.setEnabled(True)
@@ -2744,6 +3393,79 @@ class MainWindow(QMainWindow):
         self.summary_label.setText("加载失败")
         self._log(f"加载失败: {message}")
         MessageDialog.show_message(self, "加载失败", message, kind="error", theme=self.ui_theme)
+
+    def _current_preview_mode(self) -> str:
+        value = str(self.post_preview_combo.currentData() or "text")
+        return value if value in PREVIEW_MODE_KEYS else "text"
+
+    def _populate_post_cards(self, mode: str) -> None:
+        self.post_preview_panel.mode = mode
+        self.post_preview_panel.clear()
+        for post in self.posts:
+            card = PreviewCard(
+                post.id,
+                card_title(post),
+                format_post_time(post.published),
+                mode,
+                selectable=True,
+                checked=post.id in self._selected_post_ids,
+                thumbnail_url=post_thumbnail_url(post),
+            )
+            self.post_preview_panel.add_card(card)
+        self.post_preview_panel.set_checked_keys(self._selected_post_ids)
+        self.post_preview_panel.relayout()
+        self._queue_visible_thumbnails()
+
+    def _apply_post_preview_mode(self, mode: str, *, rebuild: bool = False) -> None:
+        mode = mode if mode in PREVIEW_MODE_KEYS else "text"
+        self.post_preview_panel.mode = mode
+        self.post_stack.setCurrentIndex(0 if mode == "text" else 1)
+        if mode != "text":
+            if rebuild or len(self.post_preview_panel.cards) != len(self.posts):
+                self._populate_post_cards(mode)
+            else:
+                for card in self.post_preview_panel.cards:
+                    card.mode = mode
+                self.post_preview_panel.relayout()
+            QTimer.singleShot(0, self._load_visible_thumbnails)
+
+    def _on_preview_mode_changed(self, index: int) -> None:
+        mode = str(self.post_preview_combo.itemData(index) or "text")
+        if mode not in PREVIEW_MODE_KEYS:
+            mode = "text"
+        self.app_settings.preview_mode = mode
+        try:
+            save_settings(self.app_settings)
+        except Exception:
+            pass
+        for combo in (self.post_preview_combo, self.save_preview_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, PREVIEW_MODE_KEYS.index(mode)))
+            combo.blockSignals(False)
+        self._apply_post_preview_mode(mode, rebuild=True)
+        self._apply_save_preview_mode(mode, rebuild=True)
+        self._log(f"预览方式已切换：{PREVIEW_MODE_LABELS[mode]}")
+
+    def _sync_selection_from_list(self) -> None:
+        self._selected_post_ids = {
+            str(self.post_list.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.post_list.count())
+            if self.post_list.item(index).isSelected()
+        }
+        self.post_preview_panel.set_checked_keys(self._selected_post_ids)
+
+    def _on_card_selection(self, post_id: str, checked: bool) -> None:
+        if checked:
+            self._selected_post_ids.add(post_id)
+        else:
+            self._selected_post_ids.discard(post_id)
+        self.post_list.blockSignals(True)
+        for index in range(self.post_list.count()):
+            item = self.post_list.item(index)
+            if str(item.data(Qt.ItemDataRole.UserRole)) == post_id:
+                item.setSelected(checked)
+                break
+        self.post_list.blockSignals(False)
 
     def _start_download(self) -> None:
         selected = self._selected_posts()
@@ -2772,6 +3494,8 @@ class MainWindow(QMainWindow):
         if str(root) != str(self._save_root()):
             self._rebuild_save_path_combo(root)
         self.failed_list.clear()
+        self._failed_items.clear()
+        self._update_failed_buttons()
         self.progress.setValue(0)
         self.progress.setMaximum(0)
         self.summary_label.setText("正在准备下载任务...")
@@ -2786,27 +3510,39 @@ class MainWindow(QMainWindow):
         )
         self.worker.log.connect(self._log)
         self.worker.progress.connect(self._on_progress)
-        self.worker.failed_file.connect(self._on_failed_file)
+        self.worker.failed_item.connect(self._on_failed_item)
         self.worker.finished.connect(self._on_download_finished)
         self.worker.error.connect(self._on_download_error)
         self.worker.start()
 
     def _selected_posts(self) -> list[PostItem]:
-        selected_ids: set[str] = set()
-        for index in range(self.post_list.count()):
-            item = self.post_list.item(index)
-            if item.isSelected():
-                selected_ids.add(str(item.data(Qt.ItemDataRole.UserRole)))
-        return [post for post in self.posts if post.id in selected_ids]
+        return [post for post in self.posts if post.id in self._selected_post_ids]
 
     def _select_all(self) -> None:
-        for index in range(self.post_list.count()):
-            self.post_list.item(index).setSelected(True)
+        self._selected_post_ids = {post.id for post in self.posts}
+        self._apply_selection_to_views()
 
     def _invert_selection(self) -> None:
+        self._selected_post_ids = {post.id for post in self.posts if post.id not in self._selected_post_ids}
+        self._apply_selection_to_views()
+
+    def _apply_selection_to_views(self) -> None:
+        self.post_list.blockSignals(True)
         for index in range(self.post_list.count()):
             item = self.post_list.item(index)
-            item.setSelected(not item.isSelected())
+            item.setSelected(str(item.data(Qt.ItemDataRole.UserRole)) in self._selected_post_ids)
+        self.post_list.blockSignals(False)
+        self.post_preview_panel.set_checked_keys(self._selected_post_ids)
+
+    def _queue_visible_thumbnails(self) -> None:
+        if self.post_stack.currentIndex() == 1:
+            self._thumb_timer.start()
+
+    def _load_visible_thumbnails(self) -> None:
+        if self.post_stack.currentIndex() != 1:
+            return
+        scroll = self.post_scroll.verticalScrollBar().value()
+        self.post_preview_panel.request_visible(scroll, self.post_scroll.viewport().height())
 
     def _pause(self) -> None:
         if self.worker:
@@ -2833,7 +3569,180 @@ class MainWindow(QMainWindow):
         self.summary_label.setText(f"文件进度 {done}/{total}，失败 {failed}")
 
     def _on_failed_file(self, text: str) -> None:
-        self.failed_list.addItem(text)
+        self._log(f"失败文件: {text}")
+
+    def _on_failed_item(self, item: FailedDownload) -> None:
+        self._failed_items[item.key] = item
+        self._add_failed_list_item(item)
+        self._update_failed_buttons()
+        self.failed_hint.setText(
+            f"已记录 {len(self._failed_items)} 个失败文件；可多选后重试，清除会删除失败内容、.part 缓存和状态记录。"
+        )
+
+    def _add_failed_list_item(self, failed: FailedDownload) -> None:
+        row = QListWidgetItem(
+            f"{failed.post.title}  ·  {failed.file.name}\n"
+            f"{failed.error}  ·  {failed.save_path.parent}"
+        )
+        row.setData(Qt.ItemDataRole.UserRole, failed.key)
+        row.setToolTip(str(failed.save_path))
+        self.failed_list.addItem(row)
+
+    def _remove_failed_item(self, failed: FailedDownload) -> None:
+        self._failed_items.pop(failed.key, None)
+        for index in range(self.failed_list.count() - 1, -1, -1):
+            row = self.failed_list.item(index)
+            if row.data(Qt.ItemDataRole.UserRole) == failed.key:
+                self.failed_list.takeItem(index)
+                break
+        self._update_failed_buttons()
+        self.failed_hint.setText(
+            f"已记录 {len(self._failed_items)} 个失败文件；可多选后重试，清除会删除失败内容、.part 缓存和状态记录。"
+        )
+
+    def _selected_failed_items(self) -> list[FailedDownload]:
+        result: list[FailedDownload] = []
+        for row in self.failed_list.selectedItems():
+            key = row.data(Qt.ItemDataRole.UserRole)
+            item = self._failed_items.get(tuple(key)) if isinstance(key, (tuple, list)) else None
+            if item is not None:
+                result.append(item)
+        return result
+
+    def _update_failed_buttons(self) -> None:
+        count = len(self._failed_items)
+        enabled = count > 0 and not getattr(self, "_running", False)
+        if hasattr(self, "retry_failed_button"):
+            self.retry_failed_button.setEnabled(enabled)
+        if hasattr(self, "clear_failed_button"):
+            self.clear_failed_button.setEnabled(enabled)
+
+    def _retry_failed_items(self) -> None:
+        if getattr(self, "_running", False):
+            return
+        items = self._selected_failed_items()
+        if not items:
+            MessageDialog.show_message(
+                self,
+                "还没有选择失败文件",
+                "请在失败文件列表中多选要重试的条目。",
+                kind="info",
+                theme=self.ui_theme,
+            )
+            return
+        root = self._program_root()
+        if root is None:
+            MessageDialog.show_message(self, "还没有保存目录", "无法确定重试目标目录。", kind="warning", theme=self.ui_theme)
+            return
+        self._log(f"手动重试 {len(items)} 个失败文件")
+        self.progress.setMaximum(0)
+        self.summary_label.setText("正在重试失败文件...")
+        self._set_running(True)
+        self.pause_button.setEnabled(False)
+        self.retry_worker = RetryWorker(items, root, self.app_settings)
+        self.retry_worker.log.connect(self._log)
+        self.retry_worker.progress.connect(self._on_progress)
+        self.retry_worker.recovered.connect(self._on_retry_recovered)
+        self.retry_worker.still_failed.connect(self._on_retry_still_failed)
+        self.retry_worker.finished.connect(self._on_retry_finished)
+        self.retry_worker.error.connect(self._on_retry_error)
+        self.retry_worker.start()
+
+    def _on_retry_recovered(self, failed: FailedDownload) -> None:
+        self._remove_failed_item(failed)
+        self._log(f"重试成功: {failed.file.name}")
+
+    def _on_retry_still_failed(self, failed: FailedDownload) -> None:
+        self._failed_items[failed.key] = failed
+        for index in range(self.failed_list.count()):
+            row = self.failed_list.item(index)
+            if row.data(Qt.ItemDataRole.UserRole) == failed.key:
+                row.setText(
+                    f"{failed.post.title}  ·  {failed.file.name}\n"
+                    f"{failed.error}  ·  {failed.save_path.parent}"
+                )
+                row.setToolTip(str(failed.save_path))
+                break
+
+    def _on_retry_finished(self, message: str) -> None:
+        self._log(message)
+        self.summary_label.setText(message)
+        self._set_running(False)
+        self._update_failed_buttons()
+        if self.content_tabs.currentWidget() is self.save_page:
+            self._refresh_save_view()
+
+    def _on_retry_error(self, message: str) -> None:
+        self._log(f"重试出错: {message}")
+        self.summary_label.setText("重试出错")
+        self._set_running(False)
+        self._update_failed_buttons()
+        MessageDialog.show_message(self, "重试出错", message, kind="error", theme=self.ui_theme)
+
+    def _clear_failed_items(self) -> None:
+        if getattr(self, "_running", False):
+            return
+        items = self._selected_failed_items()
+        if not items:
+            MessageDialog.show_message(
+                self,
+                "还没有选择失败文件",
+                "请先在失败文件列表中多选要清除的条目。",
+                kind="info",
+                theme=self.ui_theme,
+            )
+            return
+        dialog = MessageDialog(
+            self,
+            "确认清除失败文件",
+            f"确定删除选中的 {len(items)} 个失败文件吗？\n\n"
+            "将删除未完成的本地内容、对应的 .part 临时缓存，以及 State 里的下载状态记录。"
+            "已成功下载的文件不会被删除。",
+            kind="warning",
+            confirm=True,
+            theme=self.ui_theme,
+        )
+        dialog.exec()
+        if not dialog.confirmed:
+            return
+        removed = 0
+        for failed in items:
+            try:
+                if failed.state_key and failed.state_root is not None:
+                    StateStore(failed.state_key, root=failed.state_root).discard_file(failed.as_task())
+            except OSError as exc:
+                self._log(f"删除状态记录失败: {failed.file.name} - {exc}", danger=True)
+            for path in (failed.save_path, failed.temp_path):
+                try:
+                    if path.is_file():
+                        path.unlink()
+                except OSError as exc:
+                    self._log(f"删除失败缓存失败: {path} - {exc}", danger=True)
+            self._remove_failed_item(failed)
+            removed += 1
+        self._rewrite_failed_export()
+        self._log(f"已清除 {removed} 个失败文件及其缓存/状态记录")
+
+    def _rewrite_failed_export(self) -> None:
+        root = self._program_root()
+        if root is None:
+            return
+        path = failed_export_path(root)
+        if not self._failed_items:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"{item.file.name} | {item.post.title} | {item.save_path} | {item.error}"
+                for item in sorted(self._failed_items.values(), key=lambda value: str(value.save_path))
+            ]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self._log(f"失败记录更新失败: {exc}", danger=True)
 
     def _on_download_finished(self, message: str) -> None:
         self._log(message)
@@ -2885,6 +3794,8 @@ class MainWindow(QMainWindow):
             self.browse_button.setEnabled(not running)
         if hasattr(self, "open_dir_button"):
             self.open_dir_button.setEnabled(not running and self._save_root() is not None)
+        if hasattr(self, "_update_failed_buttons"):
+            self._update_failed_buttons()
 
     def _temp_root(self) -> Path | None:
         return resolve_temp_root(self.app_settings, self._program_root())
@@ -2936,6 +3847,8 @@ class MainWindow(QMainWindow):
     def _on_content_tab_changed(self, index: int) -> None:
         if self.content_tabs.widget(index) is self.save_page:
             self._refresh_save_view()
+        else:
+            QTimer.singleShot(0, self._load_visible_thumbnails)
 
     def _open_temp_dir(self) -> None:
         root = self._temp_root()
@@ -3023,6 +3936,7 @@ class MainWindow(QMainWindow):
         root = self._save_root()
         self.save_tree.clear()
         self._save_has_files = False
+        self._save_scan = None
         if root is None:
             self.save_path_view.clear()
             self.save_path_view.setToolTip("先选择保存目录")
@@ -3041,8 +3955,13 @@ class MainWindow(QMainWindow):
             self.save_verify_button.setEnabled(False)
             return
 
-        scan = scan_save_root(root)
+        scan = scan_save_root(
+            root,
+            state_dir=state_dir_for(self._program_root()) if self._program_root() is not None else None,
+        )
+        self._save_scan = scan
         self._populate_save_tree(scan)
+        self._apply_save_preview_mode(self._current_preview_mode(), rebuild=True)
         self._save_has_files = any(post.files for post in scan.posts)
         if not scan.posts:
             self.save_summary_label.setText("还没有本程序下载的帖子")
@@ -3059,6 +3978,40 @@ class MainWindow(QMainWindow):
         item = QTreeWidgetItem([text, "", ""])
         item.setFirstColumnSpanned(True)
         self.save_tree.addTopLevelItem(item)
+        self.save_preview_panel.clear()
+
+    def _apply_save_preview_mode(self, mode: str, *, rebuild: bool = False) -> None:
+        mode = mode if mode in PREVIEW_MODE_KEYS else "text"
+        self.save_preview_panel.mode = mode
+        self.save_stack.setCurrentIndex(0 if mode == "text" else 1)
+        if mode == "text":
+            return
+        scan = self._save_scan
+        if rebuild or len(self.save_preview_panel.cards) != len(scan.posts if scan else []):
+            self.save_preview_panel.clear()
+            if scan is not None:
+                for post in scan.posts:
+                    card = PreviewCard(
+                        str(post.path),
+                        saved_post_title(post),
+                        saved_post_time(post),
+                        mode,
+                        selectable=False,
+                        local_image=post.preview_image,
+                    )
+                    self.save_preview_panel.add_card(card)
+        self.save_preview_panel.relayout()
+        QTimer.singleShot(0, self._load_visible_save_thumbs)
+
+    def _queue_visible_save_thumbnails(self) -> None:
+        if self.save_stack.currentIndex() == 1:
+            QTimer.singleShot(80, self._load_visible_save_thumbs)
+
+    def _load_visible_save_thumbs(self) -> None:
+        if self.save_stack.currentIndex() != 1:
+            return
+        scroll = self.save_scroll.verticalScrollBar().value()
+        self.save_preview_panel.request_visible(scroll, self.save_scroll.viewport().height())
 
     def _populate_save_tree(
         self,
@@ -3119,7 +4072,9 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         self._populate_save_tree(result.scan, result)
+        self._save_scan = result.scan
         self._save_has_files = any(post.files for post in result.scan.posts)
+        self._apply_save_preview_mode(self._current_preview_mode(), rebuild=True)
         checked = result.ok_count + result.issue_count
         if not checked:
             summary = "保存目录里没有可校验的文件"
@@ -3326,6 +4281,30 @@ class MainWindow(QMainWindow):
         self.log_view.setTextCursor(cursor)
         self.log_view.ensureCursorVisible()
 
+    def _show_update_status(self, data: dict) -> None:
+        if not data:
+            return
+        status = str(data.get("status") or "")
+        stage = str(data.get("stage") or "")
+        error = str(data.get("error") or "")
+        if status == "failed":
+            message = f"外置更新器失败：{stage}" + (f"\n{error}" if error else "")
+            self._log(message, danger=True)
+            QTimer.singleShot(
+                0,
+                lambda: MessageDialog.show_message(
+                    self,
+                    "上次更新未完成",
+                    message + "\n\n旧程序已保留或已回滚，可重新检查更新。",
+                    kind="error",
+                    theme=self.ui_theme,
+                ),
+            )
+        elif status == "success":
+            self._log(f"外置更新器完成：{stage}")
+        elif status == "pending":
+            self._log(f"更新器状态：{stage}")
+
     def start_announcement_loader(self) -> None:
         """显示当前版本的更新公告；同一版本已屏蔽则不再显示。"""
         if self.app_settings.announcement_dismissed_version == APP_VERSION:
@@ -3436,6 +4415,9 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    if "--apply-update" in sys.argv:
+        from pawchive.update_helper import run_helper
+        return run_helper(sys.argv)
     set_windows_app_user_model_id()
     app = QApplication(sys.argv)
     font_family = load_app_font()
@@ -3449,6 +4431,7 @@ def main() -> int:
         pass
     window = MainWindow(font_family)
     window.show()
+    window._show_update_status(pop_update_status())
     window._maybe_self_check()
     window.start_announcement_loader()
     return app.exec()

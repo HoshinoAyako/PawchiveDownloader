@@ -255,6 +255,92 @@ def test_about_dialog() -> None:
     window.close()
 
 
+def test_update_status() -> None:
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_status_") as temp:
+        path = Path(temp) / "status.json"
+        updater.write_update_status("failed", "替换程序", target=Path("C:/tmp/app.exe"), error="locked", path=path)
+        data = updater.pop_update_status(path)
+        assert_true(data.get("status") == "failed", "更新状态读取失败")
+        assert_true(not path.exists(), "更新状态未清理")
+
+
+def test_settings_ranges() -> None:
+    from pawchive.settings import (
+        AppSettings,
+        DEFAULT_RETRY_COUNT,
+        DEFAULT_RETRY_INTERVAL,
+        MAX_RETRY_COUNT,
+        MAX_RETRY_INTERVAL,
+    )
+
+    settings = AppSettings(retry_count=0, retry_interval=99, preview_mode="bad").normalized()
+    assert_true(settings.retry_count == 1, "重试次数下限未生效")
+    assert_true(settings.retry_interval == MAX_RETRY_INTERVAL, "重试间隔上限未生效")
+    assert_true(settings.preview_mode == "text", "旧预览模式未回退")
+    assert_true(AppSettings().retry_count == DEFAULT_RETRY_COUNT, "默认重试次数错误")
+    assert_true(AppSettings().retry_interval == DEFAULT_RETRY_INTERVAL, "默认重试间隔错误")
+    assert_true(AppSettings().retry_count <= MAX_RETRY_COUNT, "默认重试次数越界")
+
+
+def test_state_discard() -> None:
+    from pawchive.downloader.models import DownloadTask, FileItem, PostItem
+    from pawchive.downloader.state import StateStore
+
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_state_") as temp:
+        state_dir = Path(temp) / "State"
+        state_dir.mkdir()
+        post = PostItem("1", "title", "2026-01-01T00:00:00", "https://example.invalid", "1", "patreon")
+        good = FileItem("https://example.invalid/ok.png", "01.png", "image")
+        bad = FileItem("https://example.invalid/bad.png", "02.png", "image")
+        target_good = Path(temp) / "01.png"
+        target_bad = Path(temp) / "02.png"
+        target_good.write_bytes(b"good")
+        task_good = DownloadTask(post, good, target_good, Path(temp) / "01.part")
+        task_bad = DownloadTask(post, bad, target_bad, Path(temp) / "02.part")
+        store = StateStore("creator", root=state_dir)
+        store.mark_file(task_good, "finished")
+        store.mark_file(task_bad, "failed", "boom")
+        store.mark_post(post, "failed")
+        assert_true(store.discard_file(task_bad), "失败状态未删除")
+        store.flush()
+        data = store.path.read_text(encoding="utf-8")
+        assert_true("02.png" not in data and "01.png" in data, "状态记录删除范围错误")
+        assert_true('"finished"' in data, "剩余成功文件状态未恢复")
+
+
+def test_preview_modes() -> None:
+    from PyQt6.QtWidgets import QApplication
+
+    from pawchive.app import gui
+    from pawchive.downloader.models import PostItem
+
+    app = QApplication.instance() or QApplication([])
+    window = gui.MainWindow(gui.load_app_font())
+    posts = [
+        PostItem(
+            str(index),
+            f"Post {index}",
+            f"2026-11-0{index}T12:00:00",
+            "https://example.invalid",
+            "1",
+            "patreon",
+            raw={"file": {"path": "/data/a.png", "name": "a.png"}},
+        )
+        for index in range(1, 3)
+    ]
+    window._on_posts_loaded(posts)
+    window.post_preview_combo.setCurrentIndex(1)
+    window._on_preview_mode_changed(1)
+    assert_true(len(window.post_preview_panel.cards) == 2, "缩略图模式卡片数错误")
+    assert_true(window.post_preview_panel.cards[0].time_label is None, "缩略图模式不应显示时间戳")
+    window.post_preview_combo.setCurrentIndex(2)
+    window._on_preview_mode_changed(2)
+    card = window.post_preview_panel.cards[0]
+    assert_true(card.title_label is not None and card.title_label.text() == "Post 1", "全部展示标题错误")
+    assert_true(card.time_label is not None and card.time_label.text() == "2026-11-01 12:00", "全部展示时间戳错误")
+    window.close()
+
+
 def run_check(name: str, func: Callable[[], None], failures: list[str]) -> None:
     started = time.perf_counter()
     try:
@@ -276,6 +362,10 @@ def main() -> int:
         ("digest-checksum", test_digest_checksum),
         ("download-hash", test_download_and_hash),
         ("install-rollback", test_install_and_rollback),
+        ("update-status", test_update_status),
+        ("settings-ranges", test_settings_ranges),
+        ("state-discard", test_state_discard),
+        ("preview-modes", test_preview_modes),
         ("about-dialog", test_about_dialog),
     ]
     failures: list[str] = []

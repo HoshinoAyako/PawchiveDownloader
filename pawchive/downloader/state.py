@@ -187,6 +187,40 @@ class StateStore:
         post_state["updated_at"] = now_text()
         self._touch()
 
+    def discard_file(self, task: DownloadTask) -> bool:
+        """删除失败文件的状态记录；若帖子已无记录则移除帖子，文件为空则删除状态文件。"""
+        posts = self.data.get("posts", {})
+        post_state = posts.get(task.post.id)
+        if not isinstance(post_state, dict):
+            return False
+        files = post_state.get("files")
+        changed = False
+        if isinstance(files, dict) and task.file.name in files:
+            files.pop(task.file.name, None)
+            changed = True
+            if files:
+                statuses = {
+                    str(item.get("status") or "") for item in files.values() if isinstance(item, dict)
+                }
+                post_state["status"] = "finished" if statuses <= {"finished", "skipped"} else "failed"
+            else:
+                posts.pop(task.post.id, None)
+        if not changed:
+            return False
+        if not posts:
+            self.data = {"version": 1, "posts": {}}
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                self._touch()
+                self.flush()
+            else:
+                self._dirty = False
+            return True
+        self._touch()
+        self.flush()
+        return True
+
     def _post_state(self, post: PostItem) -> dict[str, Any]:
         posts = self.data.setdefault("posts", {})
         return posts.setdefault(

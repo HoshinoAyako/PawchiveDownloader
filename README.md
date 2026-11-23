@@ -2,7 +2,7 @@
 
 Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载、附件筛选、并发控制、保存目录管理、日志导出和预览图/原图处理。
 
-当前版本：`v1.9.1`
+当前版本：`v1.10.0`
 
 版本号规则：自 `1.9.0` 起遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)；不兼容变更升主版本，向下兼容的新功能升次版本，向下兼容的问题修正升修订号。完整规则见 `CHANGELOG.md`。
 
@@ -14,10 +14,12 @@ Pawchive 帖子的 Windows 桌面批量下载器，提供创作者帖子加载�
 - 图片预览图/原图下载选择
 - 预览图完整性校验：发现本地文件小于远端原图时可确认替换
 - 主保存目录 + 多个额外保存目录
-- 深色/浅色主题、日志导出、失败文件与临时目录预览
+- 深色/浅色主题、日志导出、失败文件重试/清除与临时目录预览
+- 帖子列表与保存目录共用「仅文字 / 缩略图 / 全部展示」三种预览
+- 失败自动重试次数与间隔可在设置 → 性能调整
 - 启动自检：首次或主/次版本变化时检查环境、权限、路径、磁盘、资源和配置
 - 关于页：产品说明、项目地址、当前版本公告与 GitHub Release 检查更新
-- 程序更新：连通性预检、下载与替换进度、更新包与目标文件双重 SHA-256 校验、失败回滚与亮色日志提醒
+- 程序更新：外置更新器等待主程序退出后替换，备份/重试/回滚/重启，更新包与目标文件双重 SHA-256 校验
 - GitHub Actions 烟雾测试与确定性日志分析报告
 
 ## 环境
@@ -64,9 +66,9 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 2. 读取 latest Release，比较版本号；只接受 `.exe` 更新包。
 3. 更新包必须带 `SHA256SUMS.txt`、其他校验清单或 Release asset `digest`；缺失时拒绝更新。
 4. 下载时按字节显示进度并校验 SHA-256。
-5. 校验当前程序的 PE 结构、大小与目录可写性；不依赖本地哈希基线，执行强制覆盖式更新。
-6. 将运行中的旧程序重命名为 `.old` 备份，再分块写入新程序并显示复制进度；写入后回读目标文件，校验大小、PE 结构与 SHA-256；失败自动回滚。
-7. 启动新程序，旧进程退出；下次启动清理 `.old` 备份和中断的临时下载目录。
+5. 校验当前程序的 PE 结构、大小与可写性，下载并校验更新包 SHA-256。
+6. 复制当前 exe 到 Temp 作为独立更新器；主程序启动它后退出。更新器等待父进程结束，备份旧程序，重试替换；每次替换后回读大小、PE 结构与 SHA-256，失败自动回滚。
+7. 更新器写入一次性状态文件，成功则启动新程序；下次启动清理 `.old` 备份、更新器临时目录并读取上次状态。
 
 发布新版本时，请在 Release 附件中同时上传 exe 与 `SHA256SUMS.txt`：
 
@@ -74,14 +76,14 @@ pyinstaller --noconfirm --clean PawchiveDownloader.spec
 <64 位 SHA-256>  PawchiveDownloader-vX.Y.Z.exe
 ```
 
-可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.9.1.exe` 生成校验文件。仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
+可用 `python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.10.0.exe` 生成校验文件。仓库需要是 Public，程序才能匿名读取 latest Release；GitHub API 有每 IP 每小时 60 次的匿名限额。
 
 新版更新器不再在 exe 同目录生成 `<exe 名>.sha256` 安装基线；旧版本留下的该文件会在启动时删除。更新包 SHA-256 校验与写入后的目标文件回读校验仍然保留。
 
 ## 持续集成与日志分析
 
 - `.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行 Windows 烟雾测试。
-- `python tools/smoke_test.py` 覆盖模块导入、关于页构建、版本规则、校验解析、下载与更新替换路径，适合本地快速回归。
+- `python tools/smoke_test.py` 覆盖模块导入、预览模式、重试参数、状态清理、关于页、版本规则、下载与更新替换路径。
 - `python tools/ci_log_agent.py <日志> --report build/ci/ci-report.md` 生成确定性问题摘要、严重级别、证据、建议和置信度；CI 会上传日志与报告并写入运行摘要。分析不依赖外部模型或 Token。
 
 ## 数据目录

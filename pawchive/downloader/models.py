@@ -55,6 +55,29 @@ class DownloadTask:
 
 
 @dataclass(slots=True)
+class FailedDownload:
+    post: PostItem
+    file: FileItem
+    save_path: Path
+    temp_path: Path
+    error: str
+    state_key: str = ""
+    state_root: Path | None = None
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.post.id, self.file.name, str(self.save_path))
+
+    def as_task(self) -> DownloadTask:
+        return DownloadTask(
+            post=self.post,
+            file=self.file,
+            save_path=self.save_path,
+            temp_path=self.temp_path,
+        )
+
+
+@dataclass(slots=True)
 class DownloadRequest:
     creator_url: str
     output_dir: Path

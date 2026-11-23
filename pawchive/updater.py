@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -27,6 +28,8 @@ LATEST_API = f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest"
 USER_AGENT = f"PawchiveDownloader/{APP_VERSION} (+{PROJECT_URL})"
 CHECKSUM_NAMES = ("sha256sums.txt", "sha256sums", "checksums.txt")
 CHUNK_SIZE = 64 * 1024
+UPDATE_STATUS_NAME = "PawchiveDownloader-UpdateStatus.json"
+UPDATE_APPLY_PREFIX = "pawchive_update_apply_"
 
 
 class UpdateError(RuntimeError):
@@ -319,6 +322,109 @@ def verify_target(target: Path) -> TargetInfo:
     )
 
 
+def update_status_path() -> Path:
+    return Path(tempfile.gettempdir()) / UPDATE_STATUS_NAME
+
+
+def write_update_status(
+    status: str,
+    stage: str,
+    *,
+    target: Path | None = None,
+    error: str = "",
+    attempts: int = 0,
+    path: Path | None = None,
+) -> Path:
+    """原子写入外置更新器状态；下次启动由主程序读取并清理。"""
+    path = path or update_status_path()
+    payload = {
+        "status": status,
+        "stage": stage,
+        "error": error,
+        "attempts": attempts,
+        "target": str(target or ""),
+        "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = path.with_name(path.name + f".{os.getpid()}.tmp")
+    temp_name.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp_name, path)
+    return path
+
+
+def pop_update_status(path: Path | None = None) -> dict:
+    """读取并删除一次性更新状态，避免下次启动重复提示。"""
+    path = path or update_status_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return data if isinstance(data, dict) else {}
+
+
+def launch_update_helper(
+    downloaded: Path,
+    target: Path,
+    *,
+    expected_hash: str,
+    parent_pid: int | None = None,
+    timeout: int = 120,
+) -> Path:
+    """复制当前 exe 为独立更新器，交给它在主进程退出后替换并重启。
+
+    MAA 的做法是把更新动作移出主进程：主程序只负责下载/校验，真正替换由
+    另一个进程完成，从而避免 Windows 锁定正在运行的程序。这里复制当前
+    版本作为帮助进程，不额外生成新的发布资产。
+    """
+    if not downloaded.is_file():
+        raise UpdateError("启动更新器", f"更新包不存在：{downloaded}")
+    if not target.is_file():
+        raise UpdateError("启动更新器", f"目标程序不存在：{target}")
+    helper_dir = Path(tempfile.mkdtemp(prefix=UPDATE_APPLY_PREFIX))
+    helper = helper_dir / "PawchiveUpdater.exe"
+    try:
+        shutil.copy2(target, helper)
+    except OSError as exc:
+        raise UpdateError("启动更新器", f"无法复制当前程序作为更新帮助进程：{exc}") from exc
+    status_path = update_status_path()
+    write_update_status("pending", "等待主程序退出", target=target, path=status_path)
+    args = [
+        str(helper),
+        "--apply-update",
+        "--parent-pid",
+        str(parent_pid if parent_pid is not None else os.getpid()),
+        "--target",
+        str(target),
+        "--package",
+        str(downloaded),
+        "--sha256",
+        expected_hash,
+        "--status",
+        str(status_path),
+        "--timeout",
+        str(timeout),
+    ]
+    flags = 0
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        )
+    try:
+        subprocess.Popen(
+            args,
+            cwd=str(helper_dir),
+            close_fds=True,
+            creationflags=flags,
+        )
+    except OSError as exc:
+        raise UpdateError("启动更新器", f"无法启动外置更新器：{exc}") from exc
+    return helper
+
+
 def install_update(
     downloaded: Path,
     target: Path,
@@ -476,8 +582,12 @@ __all__ = [
     "expected_sha256",
     "install_update",
     "is_newer",
+    "launch_update_helper",
+    "pop_update_status",
     "probe_github_connectivity",
     "restart_application",
+    "update_status_path",
     "verify_target",
     "version_tuple",
+    "write_update_status",
 ]

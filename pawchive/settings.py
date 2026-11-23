@@ -40,6 +40,22 @@ IMAGE_SOURCE_LABELS = {
     "original": "原图",
 }
 
+# 帖子列表与保存目录共用的预览方式。
+PREVIEW_MODE_KEYS = ("text", "thumbnail", "full")
+PREVIEW_MODE_LABELS = {
+    "text": "仅文字",
+    "thumbnail": "缩略图",
+    "full": "全部展示",
+}
+
+# 下载失败后的自动重试：次数是首次失败后的追加次数，间隔为每次重试前的固定等待。
+DEFAULT_RETRY_COUNT = 3
+MIN_RETRY_COUNT = 1
+MAX_RETRY_COUNT = 9
+DEFAULT_RETRY_INTERVAL = 5
+MIN_RETRY_INTERVAL = 3
+MAX_RETRY_INTERVAL = 9
+
 # 站点限制：同时最多 5 个下载、约 1 请求/秒。并发上限按此封顶。
 MAX_FILE_CONCURRENCY = 5
 MAX_POST_CONCURRENCY = 5
@@ -360,6 +376,10 @@ def resolve_temp_root(settings: "AppSettings", output_dir: Path | None) -> Path 
 class AppSettings:
     file_concurrency: int = DEFAULT_FILE_CONCURRENCY
     post_concurrency: int = DEFAULT_POST_CONCURRENCY
+    retry_count: int = DEFAULT_RETRY_COUNT
+    retry_interval: int = DEFAULT_RETRY_INTERVAL
+    # 帖子列表 / 保存目录预览方式：text / thumbnail / full。
+    preview_mode: str = "text"
     # 图片下载源：preview 走缩略图域名，original 走文件域名。
     image_source: str = "preview"
     proxy_type: str = "none"
@@ -415,6 +435,9 @@ class AppSettings:
         return AppSettings(
             file_concurrency=self.file_concurrency,
             post_concurrency=self.post_concurrency,
+            retry_count=self.retry_count,
+            retry_interval=self.retry_interval,
+            preview_mode=self.preview_mode,
             image_source=self.image_source,
             proxy_type=self.proxy_type,
             proxy_address=self.proxy_address,
@@ -475,6 +498,13 @@ class AppSettings:
             post_concurrency=clamp_int(
                 self.post_concurrency, 1, MAX_POST_CONCURRENCY, DEFAULT_POST_CONCURRENCY
             ),
+            retry_count=clamp_int(
+                self.retry_count, MIN_RETRY_COUNT, MAX_RETRY_COUNT, DEFAULT_RETRY_COUNT
+            ),
+            retry_interval=clamp_int(
+                self.retry_interval, MIN_RETRY_INTERVAL, MAX_RETRY_INTERVAL, DEFAULT_RETRY_INTERVAL
+            ),
+            preview_mode=self.preview_mode if self.preview_mode in PREVIEW_MODE_KEYS else "text",
             image_source=self.image_source if self.image_source in IMAGE_SOURCE_KEYS else "preview",
             proxy_type=proxy_type,
             proxy_address=address,
@@ -495,6 +525,9 @@ def _settings_from_dict(data: dict) -> AppSettings:
     return AppSettings(
         file_concurrency=data.get("file_concurrency", DEFAULT_FILE_CONCURRENCY),
         post_concurrency=data.get("post_concurrency", DEFAULT_POST_CONCURRENCY),
+        retry_count=data.get("retry_count", DEFAULT_RETRY_COUNT),
+        retry_interval=data.get("retry_interval", DEFAULT_RETRY_INTERVAL),
+        preview_mode=str(data.get("preview_mode", "text") or "text"),
         image_source=str(data.get("image_source", "preview") or "preview"),
         proxy_type=str(data.get("proxy_type", "none")),
         proxy_address=str(data.get("proxy_address", "") or ""),
@@ -636,6 +669,7 @@ def describe_attachments(settings: AppSettings) -> str:
 
 def describe_settings(settings: AppSettings) -> str:
     label = f"并发 {settings.file_concurrency} / 帖子 {settings.post_concurrency}"
+    label += f" / 重试 {settings.retry_count} 次×{settings.retry_interval}s"
     label += f" / 图片 {IMAGE_SOURCE_LABELS.get(settings.image_source, '预览图')}"
     label += f" / 附件 {describe_attachments(settings)}"
     if settings.uses_proxy:

@@ -27,14 +27,15 @@ GitHub Actions 在 `.github/workflows/ci.yml` 中运行烟雾测试，上传 `bu
 - 版本比较、Release digest 解析
 - 本地 HTTP 下载、进度回调与 SHA-256
 - 强制覆盖式分块替换、目标文件回读校验、回滚、旧备份与旧 `.sha256` 清理
+- 更新状态文件一次性读写、设置范围、State 失败记录清理、三种预览模式卡片
 - 关于弹窗、主界面关于入口和产品图标
 
-它不访问 GitHub，不启动真实更新，也不会替换正在运行的程序，因此适合本地反复运行。
+它不访问 GitHub，不启动真实更新，也不会替换正在运行的程序，因此适合本地反复运行。外置更新器复制当前 exe 后的实际替换需单独做端到端验证。
 
 ## Release 校验文件
 
 ```powershell
-python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.9.0.exe
+python tools/prepare_release.py dist\PawchiveDownloader.exe --asset-name PawchiveDownloader-v1.10.0.exe
 ```
 
 输出 `dist\SHA256SUMS.txt`。发布时把 exe 和校验文件一起上传到 GitHub Release；程序更新器会拒绝没有校验信息的更新包。

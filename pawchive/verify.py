@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,6 +57,8 @@ class SavedPost:
     path: Path
     files: list[SavedFile] = field(default_factory=list)
     missing_dir: bool = False
+    title: str = ""
+    published: str = ""
 
     @property
     def total_size(self) -> int:
@@ -64,6 +67,13 @@ class SavedPost:
     @property
     def issue_count(self) -> int:
         return sum(1 for item in self.files if item.status and item.status != "ok")
+
+    @property
+    def preview_image(self) -> Path | None:
+        for item in self.files:
+            if item.path.suffix.lower() in IMAGE_EXTENSIONS:
+                return item.path
+        return None
 
 
 @dataclass(slots=True)
@@ -87,19 +97,67 @@ class VerifyResult:
     has_records: bool = False
 
 
-def scan_save_root(root: Path, max_files: int = 2000) -> SaveScan:
+def _post_name_parts(name: str) -> tuple[str, str]:
+    """从帖子目录名恢复标题与日期；兼容日期前缀和后缀两种命名。"""
+    prefix = re.match(r"^(\d{4}-\d{2}-\d{2})_(.+)$", name)
+    if prefix:
+        return prefix.group(2), prefix.group(1)
+    suffix = re.match(r"(.+)_(\d{4}-\d{2}-\d{2})$", name)
+    if suffix:
+        return suffix.group(1), suffix.group(2)
+    return name, ""
+
+
+def load_state_post_metadata(state_dir: Path | None) -> dict[str, dict[str, str]]:
+    """读取 State 里的帖子标题与发布时间，供保存目录预览使用。"""
+    result: dict[str, dict[str, str]] = {}
+    if state_dir is None or not Path(state_dir).is_dir():
+        return result
+    for state_file in sorted(Path(state_dir).glob("*.json"), key=lambda item: item.name.casefold()):
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        posts = data.get("posts") if isinstance(data, dict) else None
+        if not isinstance(posts, dict):
+            continue
+        for post_id, post in posts.items():
+            if not isinstance(post, dict):
+                continue
+            result[str(post_id)] = {
+                "title": str(post.get("title") or ""),
+                "published": str(post.get("published") or ""),
+            }
+    return result
+
+
+def scan_save_root(
+    root: Path,
+    max_files: int = 2000,
+    state_dir: Path | None = None,
+) -> SaveScan:
     """预览保存目录：每个帖子目录及其直接文件，不做文件内容检查。"""
     result = SaveScan()
     if not root.is_dir():
         return result
+    metadata = load_state_post_metadata(state_dir)
 
     shown = 0
     for post_dir in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
         if not post_dir.is_dir():
             continue
-        if not (post_dir / ".post_id").is_file():
+        marker = post_dir / ".post_id"
+        if not marker.is_file():
             continue
         post = SavedPost(path=post_dir)
+        title, published = _post_name_parts(post_dir.name)
+        try:
+            post_id = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            post_id = ""
+        meta = metadata.get(post_id, {})
+        post.title = meta.get("title") or title
+        post.published = meta.get("published") or published
         result.posts.append(post)
         try:
             children = sorted(post_dir.iterdir(), key=lambda item: item.name.casefold())
