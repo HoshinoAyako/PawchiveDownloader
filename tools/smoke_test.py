@@ -249,10 +249,22 @@ def test_about_dialog() -> None:
     assert_true(icons, "关于窗口缺少产品图标")
     about.close()
 
-    window = gui.MainWindow(font)
-    assert_true(hasattr(window, "about_button"), "主界面缺少关于按钮")
-    assert_true(window.about_button.text() == "关于", "主界面关于按钮文本不正确")
-    window.close()
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_about_") as temp:
+        from pawchive.settings import AppSettings
+
+        settings = AppSettings(output_dir=temp).normalized()
+        original_load = gui.load_settings
+        original_save = gui.save_settings
+        gui.load_settings = lambda: settings
+        gui.save_settings = lambda *args, **kwargs: None
+        try:
+            window = gui.MainWindow(font)
+            assert_true(hasattr(window, "about_button"), "主界面缺少关于按钮")
+            assert_true(window.about_button.text() == "关于", "主界面关于按钮文本不正确")
+            window.close()
+        finally:
+            gui.load_settings = original_load
+            gui.save_settings = original_save
 
 
 def test_update_status() -> None:
@@ -322,8 +334,10 @@ def test_preview_cache_path() -> None:
 
     with tempfile.TemporaryDirectory(prefix="paw_smoke_cache_path_") as temp:
         settings = AppSettings(output_dir=temp, preview_cache_mb=32).normalized()
-        original = gui.load_settings
+        original_load = gui.load_settings
+        original_save = gui.save_settings
         gui.load_settings = lambda: settings
+        gui.save_settings = lambda *args, **kwargs: None
         try:
             app = QApplication.instance() or QApplication([])
             window = gui.MainWindow(gui.load_app_font())
@@ -335,7 +349,8 @@ def test_preview_cache_path() -> None:
             )
             window.close()
         finally:
-            gui.load_settings = original
+            gui.load_settings = original_load
+            gui.save_settings = original_save
 
 
 def test_state_discard() -> None:
@@ -371,46 +386,57 @@ def test_preview_modes() -> None:
 
     from pawchive.app import gui
     from pawchive.downloader.models import PostItem
+    from pawchive.settings import AppSettings
 
     app = QApplication.instance() or QApplication([])
-    window = gui.MainWindow(gui.load_app_font())
-    posts = [
-        PostItem(
-            str(index),
-            f"Post {index}",
-            f"2026-11-0{index}T12:00:00",
-            "https://example.invalid",
-            "1",
-            "patreon",
-            raw={"file": {"path": "/data/a.png", "name": "a.png"}},
-        )
-        for index in range(1, 3)
-    ]
-    window._on_posts_loaded(posts)
-    window.post_preview_combo.setCurrentIndex(1)
-    window._on_preview_mode_changed(1)
-    assert_true(len(window.post_preview_panel.cards) == 2, "缩略图模式卡片数错误")
-    first_card = window.post_preview_panel.cards[0]
-    image = QPixmap(40, 30)
-    image.fill(QColor("#336699"))
-    buffer = QBuffer()
-    buffer.open(QIODevice.OpenModeFlag.ReadWrite)
-    assert_true(image.save(buffer, "PNG"), "测试图片编码失败")
-    assert_true(first_card.set_thumbnail_bytes(bytes(buffer.data())), "测试缩略图解码失败")
-    assert_true(first_card.has_thumbnail(), "测试缩略图未保留")
-    assert_true(first_card.time_label is not None, "缩略图模式应保留时间标签")
-    assert_true(first_card.time_label.isHidden(), "缩略图模式不应显示时间戳")
-    assert_true(first_card.title_label.isHidden(), "缩略图模式不应显示标题")
-    window.post_preview_combo.setCurrentIndex(2)
-    window._on_preview_mode_changed(2)
-    card = window.post_preview_panel.cards[0]
-    assert_true(card is first_card, "切换预览方式不应重建卡片")
-    assert_true(card.has_thumbnail(), "切换预览方式不应丢失缩略图")
-    assert_true(card.title_label.text() == "Post 1", "全部展示标题错误")
-    assert_true(card.time_label.text() == "2026-11-01 12:00", "全部展示时间戳错误")
-    assert_true(not card.title_label.isHidden(), "全部展示标题应可见")
-    assert_true(not card.time_label.isHidden(), "全部展示时间戳应可见")
-    window.close()
+    with tempfile.TemporaryDirectory(prefix="paw_smoke_preview_") as temp:
+        settings = AppSettings(output_dir=temp, preview_mode="thumbnail").normalized()
+        original_load = gui.load_settings
+        original_save = gui.save_settings
+        gui.load_settings = lambda: settings
+        gui.save_settings = lambda *args, **kwargs: None
+        try:
+            window = gui.MainWindow(gui.load_app_font())
+            posts = [
+                PostItem(
+                    str(index),
+                    f"Post {index}",
+                    f"2026-11-0{index}T12:00:00",
+                    "https://example.invalid",
+                    "1",
+                    "patreon",
+                    raw={"file": {"path": "/data/a.png", "name": "a.png"}},
+                )
+                for index in range(1, 3)
+            ]
+            window._on_posts_loaded(posts)
+            window.post_preview_combo.setCurrentIndex(1)
+            window._on_preview_mode_changed(1)
+            assert_true(len(window.post_preview_panel.cards) == 2, "缩略图模式卡片数错误")
+            first_card = window.post_preview_panel.cards[0]
+            image = QPixmap(40, 30)
+            image.fill(QColor("#336699"))
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+            assert_true(image.save(buffer, "PNG"), "测试图片编码失败")
+            assert_true(first_card.set_thumbnail_bytes(bytes(buffer.data())), "测试缩略图解码失败")
+            assert_true(first_card.has_thumbnail(), "测试缩略图未保留")
+            assert_true(first_card.time_label is not None, "缩略图模式应保留时间标签")
+            assert_true(first_card.time_label.isHidden(), "缩略图模式不应显示时间戳")
+            assert_true(first_card.title_label.isHidden(), "缩略图模式不应显示标题")
+            window.post_preview_combo.setCurrentIndex(2)
+            window._on_preview_mode_changed(2)
+            card = window.post_preview_panel.cards[0]
+            assert_true(card is first_card, "切换预览方式不应重建卡片")
+            assert_true(card.has_thumbnail(), "切换预览方式不应丢失缩略图")
+            assert_true(card.title_label.text() == "Post 1", "全部展示标题错误")
+            assert_true(card.time_label.text() == "2026-11-01 12:00", "全部展示时间戳错误")
+            assert_true(not card.title_label.isHidden(), "全部展示标题应可见")
+            assert_true(not card.time_label.isHidden(), "全部展示时间戳应可见")
+            window.close()
+        finally:
+            gui.load_settings = original_load
+            gui.save_settings = original_save
 
 
 def run_check(name: str, func: Callable[[], None], failures: list[str]) -> None:
